@@ -1,0 +1,69 @@
+CC ?= gcc
+CXX ?= g++
+
+ASCEND_HOME ?= /usr/local/Ascend/ascend-toolkit/latest
+
+V2_DIR := $(CURDIR)
+ROOT_DIR := $(abspath $(V2_DIR)/..)
+
+BUILD_DIR := build
+
+CFLAGS   ?= -O2 -Wall -fPIC
+CXXFLAGS ?= -O2 -Wall -fPIC -std=c++11
+
+INCLUDES := \
+	-I$(ASCEND_HOME)/acllib/include \
+	-I$(ROOT_DIR) \
+	-I$(V2_DIR) \
+	-I../deps/include/opencv4
+
+LIBS := \
+	-L$(ASCEND_HOME)/acllib/lib64 \
+	-L../deps/lib \
+	-lascendcl -lacl_dvpp -ldl -lrt -pthread \
+	-lopencv_core \
+	-lopencv_imgcodecs \
+	-lopencv_imgproc \
+	-lopencv_highgui \
+	-lopencv_calib3d \
+	-Wl,-rpath=$(ASCEND_HOME)/acllib/lib64 \
+	-Wl,-rpath=../deps/lib
+
+TARGET_LIB := liblximagecmp.so
+
+SRC_CPP := \
+	ascend_infer.cpp \
+	yidong_main.cpp \
+	deep_difference_detector.cpp \
+	ldc.cpp \
+	image_matcher.cpp \
+	$(ROOT_DIR)/imagecmp.cpp
+
+SRC_C := \
+	$(ROOT_DIR)/base64.c
+
+OBJ_CPP := $(addprefix $(BUILD_DIR)/,$(notdir $(SRC_CPP:.cpp=.o)))
+OBJ_C   := $(addprefix $(BUILD_DIR)/,$(notdir $(SRC_C:.c=.o)))
+OBJS    := $(OBJ_CPP) $(OBJ_C)
+
+.PHONY: all clean
+
+all: $(TARGET_LIB)
+
+$(BUILD_DIR):
+	mkdir -p $@
+
+$(TARGET_LIB): $(OBJS)
+	$(CXX) -shared -o $@ $^ $(LIBS)
+
+$(BUILD_DIR)/%.o: %.cpp | $(BUILD_DIR)
+	$(CXX) $(CXXFLAGS) $(INCLUDES) -c $< -o $@
+
+$(BUILD_DIR)/%.o: $(ROOT_DIR)/%.cpp | $(BUILD_DIR)
+	$(CXX) $(CXXFLAGS) $(INCLUDES) -c $< -o $@
+
+$(BUILD_DIR)/%.o: $(ROOT_DIR)/%.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
+clean:
+	rm -rf $(BUILD_DIR) $(TARGET_LIB)

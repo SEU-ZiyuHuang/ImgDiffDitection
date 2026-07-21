@@ -1,0 +1,1758 @@
+#include <iostream>
+#include <fstream>
+#include <opencv2/opencv.hpp>
+#include <chrono>
+#include <iostream>
+#include "base64.h"
+#include "imagecmp.h"
+
+
+#define CONFIG_HAVE_DEEP_DIFF 1
+#define CONFIG_HAVE_LDC 1
+#define CONFIG_HAVE_ImageMatcher 1
+
+#include "deep_difference_detector.h"
+#include "ldc.h"
+#include "image_matcher.h"
+
+uint64_t os_time_ms()
+{
+	// 使用 C++11 的 std::chrono 来获取当前时间戳
+	auto now = std::chrono::system_clock::now();
+	auto duration = now.time_since_epoch();
+	auto milliseconds = std::chrono::duration_cast<std::chrono::milliseconds>(duration);
+	return milliseconds.count(); // 返回毫秒数
+}
+
+
+float AreaIOU(int ax, int ay, int aw, int ah, int bx, int by, int bw, int bh) {
+	int ax2 = ax + aw;
+	int ay2 = ay + ah;
+	int bx2 = bx + bw;
+	int by2 = by + bh;
+
+	// 计算交集区域
+	int interX1 = std::max(ax, bx);
+	int interY1 = std::max(ay, by);
+	int interX2 = std::min(ax2, bx2);
+	int interY2 = std::min(ay2, by2);
+
+	int interW = interX2 - interX1;
+	int interH = interY2 - interY1;
+
+	if (interW <= 0 || interH <= 0)
+		return 0.0f;  // 没有交集
+
+	int interArea = interW * interH;
+
+	int areaA = aw * ah;
+	int areaB = bw * bh;
+	int unionArea = areaA + areaB - interArea;
+
+	return static_cast<float>(interArea) / unionArea;
+}
+
+float AreaIOU(cv::Rect rect1, cv::Rect rect2)
+{
+	return AreaIOU(rect1.x, rect1.y, rect1.width, rect1.height, rect2.x, rect2.y, rect2.width, rect2.height);
+}
+
+// 定义一个结构来存储每个步骤的信息
+struct StepInfo
+{
+	std::string name;
+	uint64_t start_time;
+	uint64_t end_time;
+};
+
+// 定义一个类来管理步骤的耗时
+class StepTimer
+{
+public:
+	// 添加步骤的开始时间
+	void push_start(const std::string& step_name, uint64_t start_time)
+	{
+		step_info_.push_back({ step_name, start_time, 0 });
+	}
+
+	// 添加步骤的结束时间
+	void push_end(const std::string& step_name, uint64_t end_time)
+	{
+		for (auto& info : step_info_)
+		{
+			if (info.name == step_name && info.end_time == 0)
+			{
+				info.end_time = end_time;
+				break;
+			}
+		}
+	}
+
+	// 打印所有步骤的耗时
+	void print_step_times() const
+	{
+		for (const auto& info : step_info_)
+		{
+			if (info.end_time != 0)
+			{
+				uint64_t duration = info.end_time - info.start_time;
+				std::cout << "Step: " << info.name << " took " << duration << " ms" << std::endl;
+			}
+		}
+	}
+
+private:
+	std::vector<StepInfo> step_info_; // 存储每个步骤的信息
+};
+
+
+std::vector<uchar> cvMat2jpgString(cv::Mat& img) {
+	// 创建一个字节流向量
+	std::vector<uchar> buf;
+
+	// 编码参数（JPEG 格式）
+	std::vector<int> params = { cv::IMWRITE_JPEG_QUALITY, 90 };
+
+	// 将图像编码为 JPEG 格式
+	bool success = cv::imencode(".jpg", img, buf, params);
+	if (!success) {
+		throw std::runtime_error("Failed to encode image as JPEG");
+	}
+	return buf;
+}
+
+void cvRect2YoloPoint(const cv::Rect& rect, int w, int h, float v[4]) {
+	if (w <= 0 || h <= 0) {
+		throw std::invalid_argument("Width and height must be positive");
+	}
+
+	// 计算中心点坐标
+	float x_center = (rect.x + rect.width / 2.0f) / w;
+	float y_center = (rect.y + rect.height / 2.0f) / h;
+
+	// 计算宽度和高度
+	float rect_width = rect.width / static_cast<float>(w);
+	float rect_height = rect.height / static_cast<float>(h);
+
+	// 确保值在 [0, 1] 范围内
+	x_center = std::max(0.0f, std::min(1.0f, x_center));
+	y_center = std::max(0.0f, std::min(1.0f, y_center));
+	rect_width = std::max(0.0f, std::min(1.0f, rect_width));
+	rect_height = std::max(0.0f, std::min(1.0f, rect_height));
+
+	// 将结果存储到数组中
+	v[0] = x_center;
+	v[1] = y_center;
+	v[2] = rect_width;
+	v[3] = rect_height;
+}
+
+//一个图形中查找另一个图片
+extern std::pair<cv::Rect, double> find_best_match(cv::Mat& large_img, cv::Mat& template_img, int& findType);
+
+//合并坐标
+extern cv::Rect merge_rectangles(const std::vector<cv::Rect>& rectangles, int threshold = 50);
+
+//缩放
+extern cv::Mat resizeAndPad(const cv::Mat& input, int target_size);
+
+//计算两张图形的相似度阈值
+extern double calculate_hist_similarity(cv::Mat& img1, cv::Mat& img2);
+
+#if 0
+
+class DeepDifferenceDetector {
+public:
+	DeepDifferenceDetector(const std::string &onnx_model_path = "resnet18.onnx");
+	std::pair<cv::Mat, cv::Mat> preprocess_image(const cv::Mat &img, const cv::Size &target_size =
+			cv::Size(224, 224));
+	cv::Mat extract_features(const cv::Mat &pil_image);
+	cv::Mat compute_dense_difference(const cv::Mat &feat_map1, const cv::Mat &feat_map2,
+			const cv::Size &original_img_shape);
+	std::vector<cv::Rect> detect_differences(const cv::Mat &srcimg1, const cv::Mat &srcimg2,
+			float difference_threshold = 0.5f, float roi_diff_threshold = 0.2f,
+			int min_contour_area = 1000, const cv::Size &target_img_size = cv::Size(224, 224));
+
+	std::vector<cv::Rect> readYoloFormatToRects(const std::string &filePath, int imageWidth,
+			int imageHeight);
+	static cv::Rect templateMatching(const cv::Mat& largeImg,
+		const cv::Mat& smallImg,
+		double& maxVal,
+		int method = cv::TM_CCOEFF_NORMED);
+
+	float computer_sim(const cv::Mat &srcimg1, const cv::Mat &srcimg2,
+			const cv::Size &target_img_size = cv::Size(224, 224));
+
+private:
+	Ort::Env env = Ort::Env(ORT_LOGGING_LEVEL_ERROR, "DEEPDIFF");
+	Ort::SessionOptions session_options = Ort::SessionOptions();
+	std::unique_ptr<Ort::Session> ort_session;
+
+	std::vector<std::string> input_names;
+	std::vector<std::string> output_names;
+	std::string device;
+
+	const std::vector<float> mean = { 0.485f, 0.456f, 0.406f };
+	const std::vector<float> std_dev = { 0.229f, 0.224f, 0.225f };
+
+};
+
+std::vector<cv::Rect> DeepDifferenceDetector::readYoloFormatToRects(const std::string &filePath,
+		int imageWidth, int imageHeight) {
+	std::vector<cv::Rect> rects;
+	std::ifstream file(filePath);
+
+	if (!file.is_open()) {
+		throw std::runtime_error("无法打开文件: " + filePath);
+	}
+
+	std::string line;
+	while (std::getline(file, line)) {
+		std::istringstream iss(line);
+		int classId;
+		float x_center, y_center, width, height;
+
+		// 读取每行数据
+		if (!(iss >> classId >> x_center >> y_center >> width >> height)) {
+			continue; // 跳过格式错误的行
+		}
+
+		// 将YOLO格式(相对坐标)转换为绝对坐标
+		int abs_width = static_cast<int>(width * imageWidth);
+		int abs_height = static_cast<int>(height * imageHeight);
+		int abs_x = static_cast<int>((x_center * imageWidth) - (abs_width / 2));
+		int abs_y = static_cast<int>((y_center * imageHeight) - (abs_height / 2));
+
+		// 确保坐标在图像范围内
+		abs_x = std::max(0, abs_x);
+		abs_y = std::max(0, abs_y);
+		abs_width = std::min(abs_width, imageWidth - abs_x);
+		abs_height = std::min(abs_height, imageHeight - abs_y);
+
+		rects.emplace_back(abs_x, abs_y, abs_width, abs_height);
+	}
+
+	return rects;
+
+}
+
+cv::Rect DeepDifferenceDetector::templateMatching(const cv::Mat &largeImg, 
+	const cv::Mat &smallImg,
+	double &maxVal,
+		int method) {
+	// 检查输入图像是否有效
+	if (largeImg.empty() || smallImg.empty()) {
+		throw std::invalid_argument("输入图像不能为空");
+	}
+	if (smallImg.rows > largeImg.rows || smallImg.cols > largeImg.cols) {
+		throw std::invalid_argument("模板图像不能大于搜索图像");
+	}
+
+	// 创建结果矩阵
+	cv::Mat result;
+	int result_cols = largeImg.cols - smallImg.cols + 1;
+	int result_rows = largeImg.rows - smallImg.rows + 1;
+	result.create(result_rows, result_cols, CV_32FC1);
+
+	// 执行模板匹配
+	cv::matchTemplate(largeImg, smallImg, result, method);
+
+	// 找到最佳匹配位置
+	double minVal;
+	cv::Point minLoc, maxLoc;
+	cv::minMaxLoc(result, &minVal, &maxVal, &minLoc, &maxLoc);
+
+	// 根据匹配方法确定最佳匹配点
+	cv::Point matchLoc;
+	if (method == cv::TM_SQDIFF || method == cv::TM_SQDIFF_NORMED) {
+		matchLoc = minLoc;
+	} else {
+		matchLoc = maxLoc;
+	}
+
+	// 返回匹配的矩形区域
+	return cv::Rect(matchLoc.x, matchLoc.y, smallImg.cols, smallImg.rows);
+}
+
+DeepDifferenceDetector::DeepDifferenceDetector(const std::string &onnx_model_path) {
+	this->device = "cpu"; // 简化版本，只使用CPU
+
+	std::cout << "初始化 DeepDifferenceDetector，使用设备: " << this->device << std::endl;
+
+	// 加载ONNX模型
+#ifdef  _WIN32
+    //windows下编译需要这样写
+    std::wstring wide_model_path(onnx_model_path.begin(), onnx_model_path.end());
+    this->ort_session = std::make_unique<Ort::Session>(env, wide_model_path.c_str(), session_options);
+#else
+	this->ort_session = std::make_unique < Ort::Session
+			> (env, onnx_model_path.c_str(), session_options);
+#endif //  _WIN32
+
+	Ort::AllocatorWithDefaultOptions allocator;
+
+	//this->input_names.push_back(this->ort_session->GetInputName(0, allocator));
+	Ort::AllocatedStringPtr input_name = ort_session->GetInputNameAllocated(0, allocator);
+	this->input_names.push_back((char*)input_name.get());
+
+	// 获取所有输出名称
+	size_t num_outputs = this->ort_session->GetOutputCount();
+	for (size_t i = 0; i < num_outputs; ++i) {
+		Ort::AllocatedStringPtr output_name = this->ort_session->GetOutputNameAllocated(i, allocator);
+		this->output_names.push_back((char*)output_name.get());
+	}
+}
+
+/*
+ std::pair<cv::Mat, cv::Mat> DeepDifferenceDetector::preprocess_image(const std::string& image_path, const cv::Size& target_size) {
+ cv::Mat img = cv::imread(image_path);
+ if (img.empty()) {
+ throw std::runtime_error("无法读取图像文件: " + image_path);
+ }
+
+ // 转换为RGB
+ cv::Mat original_color_img = img.clone();
+ cv::Mat img_gray;
+ cv::cvtColor(img, img_gray, cv::COLOR_BGR2GRAY);
+ // cv::Mat img_rgb;
+ // cv::cvtColor(img, img_rgb, cv::COLOR_BGR2RGB);
+
+
+ cv::imwrite("results/1_1.jpg", img_gray);
+
+ cv::Mat img_gray_3_channel;
+ cv::cvtColor(img_gray, img_gray_3_channel, cv::COLOR_GRAY2BGR);
+
+ // 调整大小 - 使用LANCZOS插值（对应Python的Image.LANCZOS）
+ //
+ cv::imwrite("results/1_2.jpg", img_gray_3_channel);
+
+ cv::Mat img_rgb;
+ cv::cvtColor(img_gray_3_channel, img_rgb, cv::COLOR_BGR2RGB);
+
+ cv::imwrite("results/1_3.jpg", img_rgb);
+ cv::Mat pil_img;
+ cv::resize(img_rgb, pil_img, target_size, 0, 0, cv::INTER_LANCZOS4);
+
+ cv::imwrite("results/1_4.jpg", pil_img);
+
+ // 调整原图大小用于显示
+ cv::Mat cv_img;
+ cv::resize(img, cv_img, target_size);
+
+ return {pil_img, cv_img};
+ }
+ */
+
+std::pair<cv::Mat, cv::Mat> DeepDifferenceDetector::preprocess_image(const cv::Mat &img,
+		const cv::Size &target_size) {
+	// cv::Mat img = cv::imread(image_path);
+	if (img.empty()) {
+		throw std::runtime_error("无法读取图像文件");
+	}
+
+	// 保存原始图像用于最终显示
+	cv::Mat original_color_img = img.clone();
+
+	// 转换为灰度图
+	// cv::Mat img_gray;
+	// cv::cvtColor(img, img_gray, cv::COLOR_BGR2GRAY);
+
+	// 将单通道灰度图转为3通道灰度图
+	cv::Mat img_3_channel;
+	cv::cvtColor(img, img_3_channel, cv::COLOR_BGR2RGB);
+
+	// 转换为RGB格式 (与Python的cv2.cvtColor(..., cv2.COLOR_BGR2RGB)对应)
+	// cv::Mat img_rgb;
+	// cv::cvtColor(img_gray_3_channel, img_rgb, cv::COLOR_BGR2RGB);
+
+	// 使用双三次插值调整大小 (模拟PIL的LANCZOS效果)
+	cv::Mat resized_rgb;
+	cv::resize(img_3_channel, resized_rgb, target_size, 0, 0, cv::INTER_AREA);
+
+	// cv::imwrite("results/1_4.jpg", resized_rgb);
+
+	// 调整原图大小用于显示
+	cv::Mat cv_img;
+	cv::resize(original_color_img, cv_img, target_size);
+
+	return {resized_rgb, cv_img};
+}
+
+cv::Mat normalizeMat(const cv::Mat &input) {
+	cv::Mat output;
+	cv::Mat norm;
+
+	cv::Mat floatInput;
+	if (input.depth() != CV_32F) {
+		input.convertTo(floatInput, CV_32F);
+	} else {
+		floatInput = input.clone();
+	}
+
+	cv::multiply(floatInput, floatInput, norm);
+	cv::reduce(norm, norm, 1, cv::REDUCE_SUM);
+	cv::sqrt(norm, norm);
+	// Calculate L2 norm for each row
+
+	cv::Mat mask = (norm == 0);
+	// Avoid division by zero
+	norm.setTo(1.0, mask);
+
+	// Normalize each row
+	// output = input / norm;
+	cv::Mat result(floatInput.size(), CV_32F);
+	for (int i = 0; i < floatInput.rows; ++i) {
+		float *pInput = floatInput.ptr<float>(i);
+		float *pResult = result.ptr<float>(i);
+		float n = norm.at<float>(i, 0);
+
+		for (int j = 0; j < floatInput.cols; ++j) {
+			pResult[j] = pInput[j] / n;
+		}
+	}
+
+	return result;
+}
+
+float cosineSimilarity(const cv::Mat &mat1, const cv::Mat &mat2) {
+	if (mat1.cols != mat2.cols) {
+		throw std::invalid_argument("Matrices must have the same number of columns");
+	}
+
+	// if(mat1.type() != CV_32F) mat1.convertTo(mat1, CV_32F);
+	// if(mat2.type() != CV_32F) mat1.convertTo(mat2, CV_32F);
+
+	// Compute dot product
+	float dot_product = mat1.dot(mat2);
+
+	return dot_product; // Since matrices are normalized, this is the cosine similarity
+}
+
+float computeGlobalSimilarity(const cv::Mat &feat_map1_global, const cv::Mat &feat_map2_global) {
+	// Flatten and reshape the matrices (equivalent to view(N, -1) in PyTorch)
+	cv::Mat flat1 = feat_map1_global.reshape(1,
+			feat_map1_global.rows * feat_map1_global.cols * feat_map1_global.channels());
+	cv::Mat flat2 = feat_map2_global.reshape(1,
+			feat_map2_global.rows * feat_map2_global.cols * feat_map2_global.channels());
+
+	// Transpose to make it row vector if needed (depends on your data organization)
+	flat1 = flat1.t();
+	flat2 = flat2.t();
+
+	// Normalize the vectors
+	cv::Mat feat_vec1_global = normalizeMat(flat1);
+	cv::Mat feat_vec2_global = normalizeMat(flat2);
+
+	// Compute cosine similarity
+	float global_sim = cosineSimilarity(feat_vec1_global, feat_vec2_global);
+
+	return global_sim;
+}
+
+cv::Mat DeepDifferenceDetector::extract_features(const cv::Mat &pil_image) {
+	// 转换为浮点并归一化到[0,1] (对应transforms.ToTensor())
+	cv::Mat float_img;
+	pil_image.convertTo(float_img, CV_32FC3, 1.0 / 255.0);
+
+	// 标准化 (对应transforms.Normalize)
+	std::vector<cv::Mat> channels;
+	cv::split(float_img, channels);
+	for (int c = 0; c < 3; ++c) {
+		channels[c] = (channels[c] - mean[c]) / std_dev[c];
+	}
+
+	// 调试输出：检查预处理后的数据范围
+	// std::cout << "[DEBUG] 预处理后通道数据范围:" << std::endl;
+	// for (int c = 0; c < 3; ++c) {
+	//     double min_val, max_val;
+	//     cv::minMaxLoc(channels[c], &min_val, &max_val);
+	//     std::cout << "  通道" << c << ": [" << min_val << ", " << max_val << "]" << std::endl;
+	// }
+
+	// 转换为CHW格式 (batch_size=1, channels=3, height, width)
+	std::vector<float> input_tensor_values;
+	input_tensor_values.reserve(1 * 3 * pil_image.rows * pil_image.cols);
+
+	// 按CHW顺序填充数据
+	for (int c = 0; c < 3; ++c) {
+		for (int h = 0; h < pil_image.rows; ++h) {
+			for (int w = 0; w < pil_image.cols; ++w) {
+				input_tensor_values.push_back(channels[c].at<float>(h, w));
+			}
+		}
+	}
+
+	// 调试输出：检查输入张量的前几个值
+	// std::cout << "[DEBUG] 输入张量前10个值: ";
+	// for (int i = 0; i < std::min(10, (int)input_tensor_values.size()); ++i) {
+	//     std::cout << input_tensor_values[i] << " ";
+	// }
+	// std::cout << std::endl;
+
+	// 创建输入张量
+	std::vector<int64_t> input_shape = { 1, 3, pil_image.rows, pil_image.cols };
+	Ort::MemoryInfo memory_info = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
+	Ort::Value input_tensor = Ort::Value::CreateTensor<float>(memory_info,
+			input_tensor_values.data(), input_tensor_values.size(), input_shape.data(),
+			input_shape.size());
+
+	const char *_input_names[10];
+	const char* _output_names[10];
+	{
+		for (int i = 0; i < input_names.size(); i++)
+			_input_names[i] = input_names[i].c_str();
+	}
+	{
+		for (int i = 0; i < output_names.size(); i++)
+			_output_names[i] = output_names[i].c_str();
+	}
+	// 运行推理
+	std::vector<Ort::Value> ort_outputs = ort_session->Run(Ort::RunOptions { nullptr },
+		_input_names, &input_tensor, 1, _output_names, output_names.size());
+
+	// 获取输出数据
+	float *output_data = ort_outputs[0].GetTensorMutableData<float>();
+	auto output_shape = ort_outputs[0].GetTensorTypeAndShapeInfo().GetShape();
+
+	// 调试输出：检查输出形状
+	// std::cout << "[DEBUG] ONNX输出形状: [";
+	// for (size_t i = 0; i < output_shape.size(); ++i) {
+	//     std::cout << output_shape[i];
+	//     if (i < output_shape.size() - 1) std::cout << ", ";
+	// }
+	// std::cout << "]" << std::endl;
+
+	// 转换为OpenCV Mat (输出格式: 1xCxHxW)
+	int batch_size = output_shape[0];
+	int channels_out = output_shape[1];
+	int height_out = output_shape[2];
+	int width_out = output_shape[3];
+
+	// 调试输出：检查特征图数据范围
+	size_t total_elements = batch_size * channels_out * height_out * width_out;
+	float min_feat = *std::min_element(output_data, output_data + total_elements);
+	float max_feat = *std::max_element(output_data, output_data + total_elements);
+	// std::cout << "[DEBUG] 特征图数据范围: [" << min_feat << ", " << max_feat << "]" << std::endl;
+
+	// 创建特征图 - 重新整理数据结构
+	cv::Mat feat_map(width_out * height_out, channels_out, CV_32F);
+
+	// 将NCHW格式转换为HW×C格式以便后续处理
+	for (int c = 0; c < channels_out; ++c) {
+		for (int h = 0; h < height_out; ++h) {
+			for (int w = 0; w < width_out; ++w) {
+				int src_idx = c * height_out * width_out + h * width_out + w;
+				int dst_idx = h * width_out + w;
+				feat_map.at<float>(dst_idx, c) = output_data[src_idx];
+			}
+		}
+	}
+	return feat_map;
+}
+
+cv::Mat DeepDifferenceDetector::compute_dense_difference(const cv::Mat &feat_map1,
+		const cv::Mat &feat_map2, const cv::Size &original_img_shape) {
+	// std::cout << "[DEBUG] 特征图1形状: " << feat_map1.rows << "x" << feat_map1.cols << "x" << feat_map1.channels() << std::endl;
+	// std::cout << "[DEBUG] 特征图2形状: " << feat_map2.rows << "x" << feat_map2.cols << "x" << feat_map2.channels() << std::endl;
+
+	// 确保特征图尺寸相同
+	cv::Mat feat1 = feat_map1;
+	cv::Mat feat2 = feat_map2;
+
+	if (feat1.size() != feat2.size()) {
+		cv::resize(feat1, feat1, feat2.size(), 0, 0, cv::INTER_LINEAR);
+	}
+
+	// 计算L2归一化特征 - 按行归一化 (对应F.normalize(p=2, dim=1))
+	cv::Mat feat1_norm = cv::Mat::zeros(feat1.size(), CV_32F);
+	cv::Mat feat2_norm = cv::Mat::zeros(feat2.size(), CV_32F);
+
+	for (int i = 0; i < feat1.rows; ++i) {
+		cv::Mat row1 = feat1.row(i);
+		cv::Mat row2 = feat2.row(i);
+
+		float norm1 = cv::norm(row1, cv::NORM_L2);
+		float norm2 = cv::norm(row2, cv::NORM_L2);
+
+		cv::Mat norm_row1, norm_row2;
+		if (norm1 > 1e-8) {
+			norm_row1 = row1 / norm1;
+		} else {
+			norm_row1 = cv::Mat::zeros(row1.size(), CV_32F);
+		}
+
+		if (norm2 > 1e-8) {
+			norm_row2 = row2 / norm2;
+		} else {
+			norm_row2 = cv::Mat::zeros(row2.size(), CV_32F);
+		}
+
+		norm_row1.copyTo(feat1_norm.row(i));
+		norm_row2.copyTo(feat2_norm.row(i));
+	}
+
+	// 计算绝对差异
+	cv::Mat diff_map;
+	cv::absdiff(feat1_norm, feat2_norm, diff_map);
+
+	// 计算每行的均值 (对应.mean(dim=1, keepdim=True))
+	cv::Mat mean_diff = cv::Mat::zeros(diff_map.rows, 1, CV_32F);
+	for (int i = 0; i < diff_map.rows; ++i) {
+		cv::Scalar row_mean = cv::mean(diff_map.row(i));
+		mean_diff.at<float>(i, 0) = row_mean[0];
+	}
+
+	// 重新整形为原始特征图的空间维度
+	int feat_h = static_cast<int>(std::sqrt(feat_map1.rows));
+	int feat_w = feat_map1.rows / feat_h;
+	cv::Mat spatial_diff = mean_diff.reshape(1, feat_h);
+
+	// std::cout << "[DEBUG] 空间差异图形状: " << spatial_diff.rows << "x" << spatial_diff.cols << std::endl;
+
+	// 归一化差异图
+	double min_val, max_val;
+	cv::minMaxLoc(spatial_diff, &min_val, &max_val);
+	// std::cout << "[DEBUG] 差异图范围: [" << min_val << ", " << max_val << "]" << std::endl;
+
+	cv::Mat diff_map_normalized = (spatial_diff - min_val) / (max_val - min_val + 1e-8);
+
+	// 上采样到原始图像尺寸 (对应F.interpolate)
+	cv::Mat upsampled_diff;
+	cv::resize(diff_map_normalized, upsampled_diff, original_img_shape, 0, 0, cv::INTER_LINEAR);
+
+	// std::cout << "[DEBUG] 最终差异图形状: " << upsampled_diff.rows << "x" << upsampled_diff.cols << std::endl;
+
+	return upsampled_diff;
+}
+
+float DeepDifferenceDetector::computer_sim(const cv::Mat &srcimg1, const cv::Mat &srcimg2,
+		const cv::Size &target_img_size) {
+	int srcw = srcimg1.cols, srch = srcimg1.rows;
+
+	//auto [img1_pil, img1_cv] = this->preprocess_image(srcimg1, target_img_size);
+	//auto [img2_pil, img2_cv] = this->preprocess_image(srcimg2, target_img_size);
+	std::pair<cv::Mat, cv::Mat> img1pi = this->preprocess_image(srcimg1, target_img_size);
+	cv::Mat img1_pil = img1pi.first;
+	//cv::Mat img1_cv = img1pi.second;
+
+	std::pair<cv::Mat, cv::Mat> img2pi = this->preprocess_image(srcimg2, target_img_size);
+	cv::Mat img2_pil = img2pi.first;
+
+	cv::Mat feat_map1 = this->extract_features(img1_pil);
+	cv::Mat feat_map2 = this->extract_features(img2_pil);
+
+	float simplus = computeGlobalSimilarity(feat_map1, feat_map2);
+	std::cout << "Global similarity: " << simplus << std::endl;
+
+	return simplus;
+}
+
+std::vector<cv::Rect> DeepDifferenceDetector::detect_differences(const cv::Mat &srcimg1,
+		const cv::Mat &srcimg2, float difference_threshold, float roi_diff_threshold,
+		int min_contour_area, const cv::Size &target_img_size) {
+
+	int srcw = srcimg1.cols, srch = srcimg1.rows;
+	auto start_total = std::chrono::high_resolution_clock::now();
+
+	// 1. 图像预处理
+	auto start_preprocess = std::chrono::high_resolution_clock::now();
+	//auto [img1_pil, img1_cv] = this->preprocess_image(srcimg1, target_img_size);
+	auto img1pre = this->preprocess_image(srcimg1, target_img_size);
+	//auto [img2_pil, img2_cv] = this->preprocess_image(srcimg2, target_img_size);
+	auto img2pre = this->preprocess_image(srcimg2, target_img_size);
+
+	cv::Mat img1_pil = img1pre.first;
+	cv::Mat img1_cv = img1pre.second;
+
+	cv::Mat img2_pil = img2pre.first;
+	cv::Mat img2_cv = img2pre.second;
+
+	auto time_preprocess = std::chrono::high_resolution_clock::now() - start_preprocess;
+
+	// 2. 特征提取
+	auto start_feature = std::chrono::high_resolution_clock::now();
+	cv::Mat feat_map1 = this->extract_features(img1_pil);
+	cv::Mat feat_map2 = this->extract_features(img2_pil);
+	auto time_feature = std::chrono::high_resolution_clock::now() - start_feature;
+
+	// 3.特征图相似度计算
+
+	// 4. 差异计算
+	auto start_diff = std::chrono::high_resolution_clock::now();
+	cv::Size original_img_shape(img1_cv.cols, img1_cv.rows);
+	cv::Mat diff_map = this->compute_dense_difference(feat_map1, feat_map2, original_img_shape);
+	auto time_diff = std::chrono::high_resolution_clock::now() - start_diff;
+
+	cv::Mat diff_map_scale;
+	diff_map.convertTo(diff_map_scale, CV_8U, 255);
+	// cv::imwrite("results/diff_map_sacle.jpg", diff_map_scale);
+
+	// 4. 后处理与轮廓检测
+	auto start_contour = std::chrono::high_resolution_clock::now();
+
+	// 平滑与二值化
+	cv::Mat diff_map_smoothed;
+	cv::GaussianBlur(diff_map, diff_map_smoothed, cv::Size(5, 5), 3);
+
+	cv::Mat binary = diff_map_smoothed > difference_threshold;
+	// binary.convertTo(binary, CV_8U, 255);
+	// cv::imwrite("results/binary_res.jpg", binary);
+
+	// 形态学操作
+	cv::Mat kernel = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(7, 7));
+	cv::morphologyEx(binary, binary, cv::MORPH_CLOSE, kernel);
+	cv::morphologyEx(binary, binary, cv::MORPH_OPEN, kernel);
+
+	// 轮廓检测
+	std::vector<std::vector<cv::Point>> contours;
+	cv::findContours(binary, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+
+	// 创建结果图像
+	cv::Mat output_img;
+	cv::hconcat(img1_cv, img2_cv, output_img);
+	int w_offset = img1_cv.cols;
+	int count = 0;
+
+	std::vector<cv::Rect> tarrects;
+	// 绘制显著差异区域
+	for (const auto &c : contours) {
+		double area = cv::contourArea(c);
+		std::cout << "area:" << area << std::endl;
+		if (area > min_contour_area) {
+			cv::Rect rect = cv::boundingRect(c);
+			cv::Mat roi = diff_map(rect);
+			float roi_diff = cv::mean(roi)[0];
+
+			if (roi_diff > roi_diff_threshold) {
+				/*
+				 // 在第一张图像上绘制
+				 cv::rectangle(output_img, rect, cv::Scalar(0, 0, 255), 2);
+				 // 在第二张图像上绘制（偏移）
+				 cv::rectangle(output_img,
+				 cv::Point(rect.x + w_offset, rect.y),
+				 cv::Point(rect.x + rect.width + w_offset, rect.y + rect.height),
+				 cv::Scalar(0, 0, 255), 2);
+
+				 // 添加差异分数文本
+				 std::string text = "Diff:" + std::to_string(roi_diff).substr(0, 4);
+				 cv::putText(output_img, text,
+				 cv::Point(rect.x, rect.y-5),
+				 cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 0, 255), 1);
+				 cv::putText(output_img, text,
+				 cv::Point(rect.x + w_offset, rect.y-5),
+				 cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 0, 255), 1);
+				 */
+				int tarcx = int(float(rect.x) / target_img_size.width * srcw);
+				int tarcy = int(float(rect.y) / target_img_size.height * srch);
+				int tarcw = int(float(rect.width) / target_img_size.width * srcw);
+				int tarch = int(float(rect.height) / target_img_size.height * srch);
+				std::cout << tarcx << std::endl;
+				tarrects.push_back(cv::Rect(tarcx, tarcy, tarcw, tarch));
+				count++;
+			}
+		}
+	}
+
+	auto time_contour = std::chrono::high_resolution_clock::now() - start_contour;
+	auto total_time = std::chrono::high_resolution_clock::now() - start_total;
+
+	/*
+	 // 保存结果
+	 std::string base1 = fs::path(img1_path).stem().string();
+	 std::string base2 = fs::path(img2_path).stem().string();
+	 std::string result_path = (fs::path(output_dir) / (base1 + "_" + base2 + "_result_cpp.png")).string();
+	 cv::imwrite(result_path, output_img);
+	 */
+
+	// 打印性能统计
+	std::cout << "\n===== 性能统计 =====" << std::endl;
+	std::cout << "图像预处理耗时: " << std::chrono::duration_cast < std::chrono::milliseconds
+			> (time_preprocess).count() << "毫秒" << std::endl;
+	std::cout << "特征提取耗时: " << std::chrono::duration_cast < std::chrono::milliseconds
+			> (time_feature).count() << "毫秒" << std::endl;
+	std::cout << "差异计算耗时: " << std::chrono::duration_cast < std::chrono::milliseconds
+			> (time_diff).count() << "毫秒" << std::endl;
+	std::cout << "轮廓检测耗时: " << std::chrono::duration_cast < std::chrono::milliseconds
+			> (time_contour).count() << "毫秒" << std::endl;
+	std::cout << "总耗时: " << std::chrono::duration_cast < std::chrono::milliseconds
+			> (total_time).count() << "毫秒" << std::endl;
+	std::cout << "检测到 " << count << " 个显著差异区域" << std::endl;
+	// std::cout << "结果已保存至: " << result_path << std::endl;
+
+	return tarrects;
+}
+
+std::vector<cv::Mat> splitInto3x3(const cv::Mat &src) {
+	std::vector<cv::Mat> tiles;
+
+	// 确保图像尺寸能被3整除
+	CV_Assert(src.rows % 3 == 0 && src.cols % 3 == 0);
+
+	const int tile_width = src.cols / 3;
+	const int tile_height = src.rows / 3;
+
+	for (int i = 0; i < 3; ++i) {
+		for (int j = 0; j < 3; ++j) {
+			cv::Rect roi(j * tile_width,  // x
+			i * tile_height, // y
+			tile_width,      // width
+					tile_height);    // height
+
+			tiles.push_back(src(roi).clone()); // 使用clone()确保数据独立
+		}
+	}
+
+	return tiles;
+}
+
+#endif
+
+#if 0
+
+class LDC {
+public:
+	LDC(std::string modelpath);
+	void detect(cv::Mat srcimg, cv::Mat &average_image);
+private:
+	std::vector<float> input_image_;
+	int inpWidth;
+	int inpHeight;
+	int outWidth;
+	int outHeight;
+	int num_outs;
+	Ort::Env env = Ort::Env(ORT_LOGGING_LEVEL_ERROR, "Lightweight Dense CNN for Edge Detection");
+
+	std::unique_ptr<Ort::Session> ort_session;
+	Ort::SessionOptions sessionOptions = Ort::SessionOptions();
+	std::vector<std::string> input_names;
+	std::vector<std::string> output_names;
+	std::vector<std::vector<int64_t>> input_node_dims; // >=1 outputs
+	std::vector<std::vector<int64_t>> output_node_dims; // >=1 outputs
+};
+
+LDC::LDC(std::string model_path) {
+	Ort::SessionOptions session_options = Ort::SessionOptions();
+
+	// std::wstring widestr = std::wstring(model_path.begin(), model_path.end());
+	//OrtStatus* status = OrtSessionOptionsAppendExecutionProvider_CUDA(sessionOptions, 0);
+	this->sessionOptions.SetGraphOptimizationLevel(ORT_ENABLE_BASIC);
+
+	// 加载ONNX模型
+#ifdef  _WIN32
+    std::wstring wide_model_path(model_path.begin(), model_path.end());
+    this->ort_session = std::make_unique<Ort::Session>(env, wide_model_path.c_str(), session_options);
+#else
+	this->ort_session = std::make_unique<Ort::Session>(env, model_path.c_str(), session_options);
+#endif //  _WIN32
+
+	size_t numInputNodes = ort_session->GetInputCount();
+	size_t numOutputNodes = ort_session->GetOutputCount();
+	Ort::AllocatorWithDefaultOptions allocator;
+	for (int i = 0; i < numInputNodes; i++) {
+		Ort::AllocatedStringPtr input_name = ort_session->GetInputNameAllocated(i, allocator);
+		input_names.push_back((char*)input_name.get());
+		Ort::TypeInfo input_type_info = ort_session->GetInputTypeInfo(i);
+		auto input_tensor_info = input_type_info.GetTensorTypeAndShapeInfo();
+		auto input_dims = input_tensor_info.GetShape();
+		input_node_dims.push_back(input_dims);
+	}
+
+	for (int i = 0; i < numOutputNodes; i++) {
+		Ort::AllocatedStringPtr output_name = ort_session->GetOutputNameAllocated(i, allocator);
+
+		output_names.push_back((char*)output_name.get());
+		Ort::TypeInfo output_type_info = ort_session->GetOutputTypeInfo(i);
+		auto output_tensor_info = output_type_info.GetTensorTypeAndShapeInfo();
+		auto output_dims = output_tensor_info.GetShape();
+		output_node_dims.push_back(output_dims);
+	}
+
+	this->inpHeight = input_node_dims[0][2];
+	this->inpWidth = input_node_dims[0][3];
+	this->outHeight = output_node_dims[0][2];
+	this->outWidth = output_node_dims[0][3];
+	this->num_outs = output_node_dims.size();
+
+	std::cout << __FUNCTION__ << ",in:" << this->inpWidth << "," << this->inpHeight << ",out:"
+			<< this->outWidth << "," << this->outHeight << std::endl;
+}
+
+void LDC::detect(cv::Mat srcimg, cv::Mat &average_image) {
+	average_image = cv::Mat::zeros(srcimg.rows, srcimg.cols, CV_32FC1);
+	cv::Mat fuse_image(srcimg.rows, srcimg.cols, CV_8UC1);
+
+	cv::Mat dstimg;
+	cv::resize(srcimg, dstimg, cv::Size(this->inpWidth, this->inpHeight));
+	this->input_image_.resize(this->inpWidth * this->inpHeight * dstimg.channels());
+	for (int c = 0; c < 3; c++) {
+		for (int i = 0; i < this->inpHeight; i++) {
+			for (int j = 0; j < this->inpWidth; j++) {
+				float pix = dstimg.ptr<uchar>(i)[j * 3 + 2 - c];
+				this->input_image_[c * this->inpHeight * this->inpWidth + i * this->inpWidth + j] =
+						pix;
+			}
+		}
+	}
+	std::array<int64_t, 4> input_shape_ { 1, 3, this->inpHeight, this->inpWidth };
+
+	auto allocator_info = Ort::MemoryInfo::CreateCpu(OrtDeviceAllocator, OrtMemTypeCPU);
+	Ort::Value input_tensor_ = Ort::Value::CreateTensor<float>(allocator_info, input_image_.data(),
+			input_image_.size(), input_shape_.data(), input_shape_.size());
+
+	// 开始推理
+	const char* _input_names[10];
+	const char* _output_names[10];
+
+	for (int i = 0; i < input_names.size(); i++) {
+		_input_names[i] = input_names[0].c_str();
+	}
+	for (int i = 0; i < output_names.size(); i++) {
+		_output_names[i] = output_names[i].c_str();
+	}
+
+	std::vector<Ort::Value> ort_outputs = ort_session->Run(Ort::RunOptions { nullptr }, 
+		_input_names, &input_tensor_, 1, 
+		_output_names, output_names.size()); // 开始推理
+
+	for (int n = 0; n < num_outs; n++) {
+		float *pred = ort_outputs[n].GetTensorMutableData<float>();
+		/*this->outHeight = output_node_dims[n][2];
+		 this->outWidth = output_node_dims[n][3];*/
+		cv::Mat result(outHeight, outWidth, CV_32FC1, pred);
+		/*for (int i = 0; i < this->outHeight; i++)
+		 {
+		 for (int j = 0; j < this->outWidth; j++)
+		 {
+		 float pix = result.ptr<float>(i)[j];
+		 result.at<float>(i, j) = 1 / (1 + expf(-pix));   ///sigmoid
+		 }
+		 }*/
+		cv::Mat TmpExp;
+		cv::exp(-result, TmpExp);   ///不用for循环
+		cv::Mat mask = 1.0 / (1.0 + TmpExp);
+
+		double min_value, max_value;
+		cv::minMaxLoc(mask, &min_value, &max_value, 0, 0);
+		mask = (mask - min_value) * 255.0 / (max_value - min_value + 1e-12);
+		mask.convertTo(mask, CV_8UC1);
+		cv::bitwise_not(mask, mask);
+		cv::resize(mask, mask, cv::Size(srcimg.cols, srcimg.rows));
+
+		cv::accumulate(mask, average_image);  //将所有图像叠加
+		fuse_image = mask;
+	}
+	average_image = average_image / (float) num_outs; //求出平均图像
+	average_image.convertTo(average_image, CV_8UC1);
+}
+
+#endif
+
+/////////////////////////////////////////////////////////////////////////////////////
+#if 0
+int main(int argc, char* argv[]) {
+    try {
+        DeepDifferenceDetector detector("resnet18.onnx");
+
+        std::string img1_path = argv[1];
+        std::string img2_path = argv[2];
+        std::string yolo_txt = argv[3];
+
+        cv::Mat simg1 = cv::imread(img1_path); //实时图片
+        cv::Mat simg2 = cv::imread(img2_path); //模板
+        int lw = simg1.cols, lh = simg1.rows;
+
+        // 从yolo文件获取坐标
+        std::vector<cv::Rect> reccs = detector.readYoloFormatToRects(yolo_txt, lw, lh);
+
+        for (int i = 0; i < reccs.size(); ++i)
+        {
+            // 实时图片切图
+            cv::Mat timg = simg1(reccs[i]);
+            // cv::imwrite("tarimgs/" + std::to_string(i) + "_out.jpg", timg);
+            // 匹配图像
+            cv::Rect matchrect = detector.templateMatching(simg2, timg);
+
+            cv::Mat tempCropMat = simg2(matchrect);
+
+            float sim_value = detector.computer_sim(timg, tempCropMat);
+
+            if (sim_value > 0.9)
+            {
+                continue;
+            }
+            
+            if (sim_value >= 0.5)
+            {
+                std::vector<cv::Rect> tarv = detector.detect_differences(
+                    timg,
+                    tempCropMat,
+                    0.7f,        // difference_threshold (对应Python版本)
+                    0.7f,        // roi_diff_threshold (对应Python版本)
+                    500,         // min_contour_area (对应Python版本)                    
+                    cv::Size(224, 224)  // target_img_size (对应Python版本)
+                );
+                //陈坚处理
+
+            }
+            else
+            {
+                float new_sim_value = detector.computer_sim(timg, simg2(reccs[i]));
+                //陈坚处理
+
+            }
+
+
+        }
+
+        // cv::imwrite("tarimgs/match_out.jpg", simg2);
+
+        /*
+            std::vector<cv::Rect> tarv = detector.detect_differences(
+                img1_path,
+                img2_path,
+                0.7f,        // difference_threshold (对应Python版本)
+                0.7f,        // roi_diff_threshold (对应Python版本)
+                500,         // min_contour_area (对应Python版本)
+                "results",   // output_dir (对应Python版本)
+                cv::Size(224, 224)  // target_img_size (对应Python版本)
+            );
+        */
+
+        // cv::Mat srcimg = cv::imread(img1_path);
+        // for(cv::Rect rec : tarv) cv::rectangle(srcimg, rec, cv::Scalar(0,255,0), 2);
+
+        // cv::imwrite("results/out.jpg", srcimg);
+
+    }
+    catch (const std::exception& e) {
+        std::cerr << "错误: " << e.what() << std::endl;
+        return 1;
+    }
+    return 0;
+}
+
+#endif
+
+//////////////////////////////////////////////////////
+#if 0
+
+struct MatchResult {
+	std::vector<cv::Point2f> keypoints_left;
+	std::vector<cv::Point2f> keypoints_right;
+	std::vector<cv::Point2f> matched_left;
+	std::vector<cv::Point2f> matched_right;
+};
+
+class ImageMatcher {
+private:
+	std::string model_path_;
+	int height_;
+	int width_;
+
+	// Matching parameters
+	float DISTANCE_THRESHOLD = 150.0f;
+	float CONFIDENCE_THRESHOLD = 0.5f;
+	int MAX_KEYPOINTS = 1024;
+	int MIN_GLOBAL_MATCHES = 150;
+	int MIN_BOX_MATCHES = 5;
+	int MAX_BOX_AREA = 2000;
+
+	// ONNX Runtime session
+	Ort::Env env_;
+	Ort::SessionOptions session_options_;
+	std::unique_ptr<Ort::Session> session_;
+	std::mutex session_mutex_;
+
+public:
+	ImageMatcher(const std::string& model_path = "weights/superpoint_lightglue_pipeline.onnx")
+		: env_(ORT_LOGGING_LEVEL_WARNING, "ImageMatcher"),
+		model_path_(model_path),
+		height_(512),
+		width_(512) {
+
+		// Configure ONNX Runtime session options
+		session_options_.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_DISABLE_ALL);
+		session_options_.SetExecutionMode(ExecutionMode::ORT_PARALLEL);
+		session_options_.SetIntraOpNumThreads(2);
+		session_options_.SetInterOpNumThreads(2);
+
+		// Initialize session
+#ifdef  _WIN32
+		std::wstring wide_model_path(model_path.begin(), model_path.end());
+		this->session_ = std::make_unique<Ort::Session>(env_, wide_model_path.c_str(), session_options_);
+#else
+		this->session_ = std::make_unique<Ort::Session>(env_, model_path.c_str(), session_options_);
+#endif //  _WIN32
+	}
+
+	std::vector<cv::Mat> preprocess_images(const std::vector<cv::Mat>& images) {
+		std::vector<cv::Mat> processed;
+
+		for (const auto& img : images) {
+			cv::Mat gray;
+			if (img.channels() == 3) {
+				cv::cvtColor(img, gray, cv::COLOR_BGR2GRAY);
+			}
+			else {
+				gray = img.clone();
+			}
+
+			cv::Mat normalized;
+			gray.convertTo(normalized, CV_32F, 1.0 / 255.0);
+
+			// Add batch dimension
+			cv::Mat with_batch = normalized.reshape(1, { 1, normalized.rows, normalized.cols });
+			processed.push_back(normalized);
+		}
+
+		return processed;
+	}
+
+	std::vector<std::vector<float>> parse_yolo_file(const std::string& filepath) {
+		std::vector<std::vector<float>> boxes;
+
+		std::ifstream file(filepath);
+		if (!file.is_open()) {
+			return boxes;
+		}
+
+		std::string line;
+		while (std::getline(file, line)) {
+			std::istringstream iss(line);
+			std::vector<float> values;
+			float val;
+
+			while (iss >> val) {
+				values.push_back(val);
+			}
+
+			if (values.size() != 5) continue;
+
+			// Convert YOLO format to pixel coordinates
+			int class_id = static_cast<int>(values[0]);
+			float center_x = values[1] * width_;
+			float center_y = values[2] * height_;
+			float width = values[3] * width_;
+			float height = values[4] * height_;
+
+			float half_width = width / 2.0f;
+			float half_height = height / 2.0f;
+
+			int x_min = std::max(0, static_cast<int>(center_x - half_width));
+			int y_min = std::max(0, static_cast<int>(center_y - half_height));
+			int x_max = std::min(width_ - 1, static_cast<int>(center_x + half_width));
+			int y_max = std::min(height_ - 1, static_cast<int>(center_y + half_height));
+
+			boxes.push_back({
+				static_cast<float>(class_id),
+				static_cast<float>(x_min),
+				static_cast<float>(y_min),
+				static_cast<float>(x_max),
+				static_cast<float>(y_max)
+				});
+		}
+
+		return boxes;
+	}
+
+	MatchResult get_matches(const cv::Mat& left_img, const cv::Mat& right_img) {
+		cv::Mat left_img_resize;
+		cv::Mat right_img_resize;
+
+		cv::resize(left_img, left_img_resize, cv::Size(width_, height_));
+		cv::resize(right_img, right_img_resize, cv::Size(width_, height_));
+
+		std::vector<cv::Mat> images = { left_img_resize, right_img_resize };
+		auto preprocessed = preprocess_images(images);
+
+		// Prepare input tensor
+		std::vector<int64_t> input_shape = { 2, 1, height_, width_ };
+		size_t input_size = 2 * 1 * height_ * width_;
+
+		std::vector<float> input_values;
+		for (const auto& img : preprocessed) {
+			input_values.insert(input_values.end(), img.ptr<float>(), img.ptr<float>() + img.total());
+		}
+
+		Ort::MemoryInfo memory_info = Ort::MemoryInfo::CreateCpu(
+			OrtAllocatorType::OrtArenaAllocator, OrtMemType::OrtMemTypeDefault);
+
+		Ort::Value input_tensor = Ort::Value::CreateTensor<float>(
+			memory_info, input_values.data(), input_size, input_shape.data(), input_shape.size());
+
+		std::vector<char*> inp_names = { "images" };
+		std::vector<char*> out_names = { "keypoints", "matches", "mscores" };
+		// Run inference
+		std::lock_guard<std::mutex> lock(session_mutex_);
+		auto output_tensors = session_->Run(
+			Ort::RunOptions{ nullptr },
+			inp_names.data(),
+			&input_tensor,
+			1,
+			out_names.data(),
+			out_names.size()
+		);
+
+		// Process outputs
+		int64_t* keypoints_data = output_tensors[0].GetTensorMutableData<int64_t>();
+
+		int64_t* matches_data = output_tensors[1].GetTensorMutableData<int64_t>();
+		float* match_scores_data = output_tensors[2].GetTensorMutableData<float>();
+
+		auto keypoints_shape = output_tensors[0].GetTensorTypeAndShapeInfo().GetShape();
+		auto matches_shape = output_tensors[1].GetTensorTypeAndShapeInfo().GetShape();
+
+		// Extract keypoints
+		std::vector<cv::Point2f> kp_left, kp_right;
+		size_t left_kp_count = keypoints_shape[1];
+		// size_t right_kp_count = keypoints_shape[2] / 2;
+
+		for (size_t i = 0; i < left_kp_count; ++i) {
+			if (i >= MAX_KEYPOINTS) break;
+			kp_left.emplace_back(
+				keypoints_data[i * 2],
+				keypoints_data[i * 2 + 1]);
+		}
+
+		for (size_t i = 0; i < left_kp_count; ++i) {
+			if (i >= MAX_KEYPOINTS) break;
+			kp_right.emplace_back(
+				keypoints_data[left_kp_count * 2 + i * 2],
+				keypoints_data[left_kp_count * 2 + i * 2 + 1]);
+		}
+
+
+		// Filter matches
+		std::vector<cv::Point2f> matched_left;
+		std::vector<cv::Point2f> matched_right;
+
+		for (size_t i = 0; i < matches_shape[0]; ++i) {
+			if (match_scores_data[i] <= CONFIDENCE_THRESHOLD) continue;
+			if (matches_data[i * 3] != 0) continue; // Only consider matches from left to right
+
+			int64_t left_idx = matches_data[i * 3 + 1];
+			int64_t right_idx = matches_data[i * 3 + 2];
+
+			if (left_idx >= kp_left.size() || right_idx >= kp_right.size()) continue;
+
+			cv::Point2f pt_left = kp_left[left_idx];
+			cv::Point2f pt_right = kp_right[right_idx];
+
+			float distance = cv::norm(pt_left - pt_right);
+			if (distance <= DISTANCE_THRESHOLD) {
+				matched_left.push_back(pt_left);
+				matched_right.push_back(pt_right);
+			}
+		}
+
+		return { kp_left, kp_right, matched_left, matched_right };
+	}
+
+	cv::Rect resizePoint(const cv::Rect& srcRect, int srcW, int srcH, int dstW, int dstH) {
+		// 计算缩放比例
+		float scaleX = static_cast<float>(dstW) / srcW;
+		float scaleY = static_cast<float>(dstH) / srcH;
+
+		// 转换坐标和大小
+		int x = static_cast<int>(srcRect.x * scaleX);
+		int y = static_cast<int>(srcRect.y * scaleY);
+		int w = static_cast<int>(srcRect.width * scaleX);
+		int h = static_cast<int>(srcRect.height * scaleY);
+
+		// 确保坐标和大小不小于 0
+		x = std::max(0, x);
+		y = std::max(0, y);
+		w = std::max(0, w);
+		h = std::max(0, h);
+
+		// 确保坐标和大小不超过目标图片的宽度和高度
+		x = std::min(x, dstW - 1);
+		y = std::min(y, dstH - 1);
+		w = std::min(w, dstW - x);
+		h = std::min(h, dstH - y);
+
+		return cv::Rect(x, y, w, h);
+	}
+
+	bool feature_match(int x_min, int y_min, int x_max, int y_max, std::vector<cv::Point2f>& matched_kp_l,
+		std::vector<cv::Point2f>& match_l, std::vector<cv::Point2f>& match_r, cv::Rect& tarrec)
+	{
+		std::cout << "全部特征点总数:" << matched_kp_l.size() << " 匹配特征点:" << match_l.size() << std::endl;
+
+		if (match_l.size() <= MIN_GLOBAL_MATCHES)
+		{
+			return false;
+		}
+
+		int w = x_max - x_min;
+		int h = y_max - y_min;
+		int box_area = w * h;
+
+		// 小部件默认匹配到
+		if (box_area <= MAX_BOX_AREA)
+		{
+			printf("特征匹配(%d,%d,%d,%d):box_area:%d<%d\n", x_min, y_min, x_max, y_max, box_area, MAX_BOX_AREA);
+			tarrec = cv::Rect(x_min, y_min, (x_max - x_min), (y_max - y_min));
+			return true;
+		}
+
+		int matches_in_box = 0;
+			
+		for (int i = 0; i < 5; ++i)
+		{
+			std::cout << matched_kp_l[i].x << std::endl;
+			std::cout << matched_kp_l[i].y << std::endl;
+		}
+		for (const auto& pt : matched_kp_l)
+		{
+			if (pt.x >= x_min && pt.x <= x_max && pt.y >= y_min && pt.y <= y_max) {
+				matches_in_box++;
+			}
+		}
+
+		printf("匹配到yolo框内坐标点的个数:%d, (%d,%d,%d,%d)\n", matches_in_box, x_min, y_min, x_max, y_max);
+
+		if (matches_in_box >= MIN_BOX_MATCHES)
+		{
+			cv::Mat H = cv::Mat();
+			if (match_l.size() >= MIN_BOX_MATCHES && match_r.size() >= MIN_BOX_MATCHES)
+			{
+				H = cv::findHomography(match_l, match_r, cv::RANSAC, 0.5);
+			}
+			std::vector<cv::Point2f> pts = {
+				cv::Point2f(x_min, y_min),
+				cv::Point2f(x_max, y_min),
+				cv::Point2f(x_max, y_max),
+				cv::Point2f(x_min, y_max)
+			};
+
+			// Apply perspective transform
+			std::vector<cv::Point2f> dst_corners;
+			cv::perspectiveTransform(pts, dst_corners, H);
+
+			int tarxmin = static_cast<int>(dst_corners[0].x);
+			int tarymin = static_cast<int>(dst_corners[0].y);
+			int tarxmax = static_cast<int>(dst_corners[2].x);
+			int tarymax = static_cast<int>(dst_corners[2].y);
+			std::cout << "投影的坐标框" << std::endl;
+			std::cout << tarxmin << std::endl;
+			std::cout << tarymin << std::endl;
+			std::cout << tarxmax << std::endl;
+			std::cout << tarymax << std::endl;
+
+			tarrec = cv::Rect(tarxmin, tarymin, (tarxmax - tarxmin), (tarymax - tarymin));
+			return true;
+		}
+
+		std::cout << "特征匹配未找到" << std::endl;
+
+		tarrec = cv::Rect(0, 0, 0, 0);
+		return false;
+	}
+	
+
+	bool feature_match(cv::Rect srcbox, int bW, int bH, std::vector<cv::Point2f>& matched_kp_l,
+		std::vector<cv::Point2f>& match_l, std::vector<cv::Point2f>& match_r, cv::Rect& tarrec)
+	{
+		cv::Rect box = resizePoint(srcbox, bW, bH, width_, height_);
+
+		int x_min = box.x;
+		int y_min = box.y;
+		int x_max = box.x + box.width;
+		int y_max = box.y + box.height;
+		
+		return feature_match(x_min, y_min, x_max, y_max, matched_kp_l, match_l, match_r, tarrec);
+	}
+
+	cv::Rect outRect(cv::Rect srcRect, int dstW, int dstH) {		
+		return resizePoint(srcRect, width_, height_, dstW, dstH);
+	}
+};
+
+#endif
+
+void saveimage(const char *outCropImagePath, cv::Mat &img, cv::Rect rect, int resize) {
+	if (outCropImagePath && strlen(outCropImagePath) > 0) {
+		bool wret = false;
+		if (resize > 0) {
+
+			if (rect.width > resize || rect.height > resize) {
+				cv::Mat cropImg = img(rect).clone();
+				cv::Mat out = resizeAndPad(cropImg, resize);
+				wret = cv::imwrite(outCropImagePath, out);
+			} else {
+				 // 计算中心
+				cv::Point center = (rect.tl() + rect.br()) / 2;
+
+				// 计算新左上角坐标
+				int x0 = center.x - resize / 2;
+				int y0 = center.y - resize / 2;
+
+				// 与图像边界做裁剪
+				x0 = std::max(0, std::min(x0, img.cols - resize));
+				y0 = std::max(0, std::min(y0, img.rows - resize));
+
+				// 生成新的 640×640 矩形
+				rect = cv::Rect(x0, y0, resize, resize);
+				cv::Mat cropImg = img(rect).clone();
+				wret = cv::imwrite(outCropImagePath, cropImg);
+			}
+		}
+		if (!wret) {
+			std::cout << "file write error　" << outCropImagePath << std::endl;
+		}
+	} else {
+		std::cout << "not set out file path" << std::endl;
+	}
+}
+
+//图片中查找图片
+int ImgFindImg(cv::Mat& imgLive, cv::Mat& imgTemp, cv::Mat& tmpCrop, cv::Rect rectTmpBox, cv::Rect& rectOut, double& value, int& findtype) {
+
+	//模板匹配
+	findtype = 0;
+	cv::Rect rect = DeepDifferenceDetector::templateMatching(imgLive,
+		tmpCrop,
+		value,
+		cv::TM_CCOEFF_NORMED);
+	
+	float iou = AreaIOU(rect, rectTmpBox);
+
+	printf("模板匹配结果 %.4f 坐标:%d,%d,%d,%d  iou=%.2f\n", value, rect.x, rect.y, rect.width, rect.height, iou);
+	if (value > 0.85 && iou > 0.1) {
+		rectOut = rect;
+		return 0;
+	}
+
+	findtype = 1;
+
+	printf("特征匹配中...\n");
+	//特征匹配器
+	ImageMatcher im("superpoint_lightglue_pipeline_512x512_linux_aarch64.om");
+
+	cv::Mat left_img = imgTemp;// imgLive;	
+	cv::Mat right_img = imgLive; // imgTemp;
+
+	// 获取全局匹配结果
+	MatchResult mres = im.get_matches(left_img, right_img);
+	//MatchResult mres = im.get_matches(right_img, left_img);
+
+	// 匹配小图结果保存
+	cv::Rect tarrect;
+	bool matchres = im.feature_match(rectTmpBox, imgTemp.cols, imgTemp.rows, mres.keypoints_left, mres.matched_left, mres.matched_right, tarrect);
+
+	// 匹配成功
+	if (matchres)
+	{
+		value = 0;
+
+		printf("特征匹配成功\n");
+		rectOut = im.outRect(tarrect, imgTemp.cols, imgTemp.rows);
+		//rectOut需要与yolo坐标框 进行互补?是否需要?
+		return 0;
+	} else {
+		printf("ImageMatcher模型特征匹配失败\n");
+	}
+	return 0;
+}
+
+extern "C" {
+
+	LXAPI void lxFreePtr(char* ptr) {
+		if (ptr)
+			free(ptr);
+	}
+
+//liveImagePath: 实时图像地址
+//tempImagePath: 样本图像地址
+//yolo(x,y,w,h): yolo坐标点(对应样本图片)
+//float threshold,
+//outCropImagePath: 输出的切图地址(需要缩放成640)
+//return -1; notfind, -2 error; 0 没有找到; 1 找到
+	LXAPI int lxImageCmpOnnx(
+		const char* liveImagePath,
+		const char* tempImagePath,
+		float yolo_x, float yolo_y, float yolo_w, float yolo_h,
+		float threshold,
+		float* simres,
+		struct Box* box,
+		const char* outCropImagePath,
+		int resize,
+		float liveRectYolo[4],
+		char** oImgLiveB64,
+		char** oImgTmpB64
+	) {
+		cv::Mat imgLive = cv::imread(liveImagePath); //BGR
+		cv::Mat imgTemp = cv::imread(tempImagePath); //BGR 模板图片
+
+		*oImgLiveB64 = 0;
+		*oImgTmpB64 = 0;
+
+		memset(liveRectYolo, 0, sizeof(liveRectYolo));
+		memset(box, 0, sizeof(Box));
+		if (imgLive.empty() || imgTemp.empty()) {
+			printf("error: not open image\n");
+			return -2;
+		}
+
+		if (imgLive.rows != imgTemp.rows || imgLive.cols != imgTemp.cols) {
+			printf("image size not equ\n");
+			return -3;
+		}
+
+		StepTimer stepTimer;
+
+		try {
+			int img_width = imgTemp.cols;
+			int img_height = imgTemp.rows;
+			cv::Rect rectBox;
+			{
+				int x1, y1, box_width, box_height;
+				yolo2rect(yolo_x, yolo_y, yolo_w, yolo_h, img_width, img_height, x1, y1, box_width,
+					box_height);
+
+				printf("yolo转真实坐标:(%.5f,%.5f,%.5f,%.5f)(%d,%d)-> %d,%d,%d,%d\n",
+					yolo_x, yolo_y, yolo_w, yolo_h,
+					img_width, img_height,
+					x1, y1, box_width, box_height);
+
+				if (x1 < 0 || y1 < 0 || box_width <= 3 || box_height <= 3) {
+					std::cerr << "坐标或尺寸无效！" << std::endl;
+					return -4;
+				}
+				if (x1 + box_width > img_width || y1 + box_height > img_height) {
+					std::cerr << "范围超过图像大小！" << std::endl;
+					return -4;
+				}
+
+				rectBox.x = x1;
+				rectBox.y = y1;
+				rectBox.width = box_width;
+				rectBox.height = box_height;
+			}
+
+			//样本截图
+			cv::Mat imgTempCrop = imgTemp(rectBox).clone();
+
+			if (imgTempCrop.empty()) {
+				std::cerr << "截图为空" << std::endl;
+				return -1;
+			}
+
+			//需要寻找
+			//查找最佳匹配物体
+			//int findType = -1;
+			//std::pair<cv::Rect, double> result = find_best_match(imgLive, imgTempCrop, findType);
+			//cv::Rect best_match = result.first;
+			//double match_score = result.second;
+			//模板匹配
+			int imgFindType;
+			cv::Rect imgFindRect;
+			double templateMaxValue = 0.0;
+
+			stepTimer.push_start("匹配", os_time_ms());
+			int ret = ImgFindImg(imgLive, imgTemp, imgTempCrop, rectBox, imgFindRect, templateMaxValue, imgFindType);
+			stepTimer.push_end("匹配", os_time_ms());
+
+			if (imgFindRect.empty()) {
+				std::cout << "图片匹配未找到目标,type=" << imgFindType << ",templateMaxValue=" << templateMaxValue << std::endl;
+				stepTimer.print_step_times();
+				return -6;
+			}
+
+			//实时图片样本匹配截图
+			printf("图片匹配结果(方式%d) %.4f 坐标:%d,%d,%d,%d\n", imgFindType, templateMaxValue, imgFindRect.x, imgFindRect.y, imgFindRect.width, imgFindRect.height);
+
+			if (imgFindRect.width > rectBox.width + 10 || imgFindRect.height > rectBox.height + 10) {
+				printf("匹配图像大小超过yolo模板大小: %dx%d > %dx%d\n", imgFindRect.width, imgFindRect.height, rectBox.width, rectBox.height);
+				return -5;
+			}
+
+			cvRect2YoloPoint(imgFindRect, imgLive.cols, imgLive.rows, liveRectYolo);
+
+			if (imgFindType == 0 && templateMaxValue >= 0.85) {
+				//没有异动?
+				saveimage(outCropImagePath, imgLive, imgFindRect, resize);
+				return 0;
+			}
+
+			//模板匹配 图片
+			cv::Mat imgLiveFindCrop = imgLive(imgFindRect).clone();
+			if (imgLiveFindCrop.empty()) {
+				std::cerr << "best_match截图为空" << std::endl;
+				return -1;
+			}
+
+			stepTimer.push_start("LDC", os_time_ms());
+			//轮廓图
+			LDC ldcnet("LDC_640x360.om");
+
+			//样本截图轮廓图
+			cv::Mat imgTempCropLDC;
+			ldcnet.detect(imgTempCrop, imgTempCropLDC);
+
+			//实时样本图片匹配截图轮廓图
+			cv::Mat imgLiveCropLDC;
+			ldcnet.detect(imgLiveFindCrop, imgLiveCropLDC);
+
+			stepTimer.push_end("LDC", os_time_ms());
+
+			stepTimer.push_start("异动", os_time_ms());
+			//还需要做异动对比
+			DeepDifferenceDetector detector("resnet18.om");
+			{
+				std::vector<cv::Rect> cmpRects;
+				//轮廓图片对比
+				float score = detector.computer_sim(imgLiveCropLDC, imgTempCropLDC);
+				*simres = score;
+				if (score > threshold) {
+					std::cout << "保存: 实时图片样本匹配截图(超过阈值)" << std::endl;
+					saveimage(outCropImagePath, imgLive, imgFindRect, resize);
+					memset(box, 0, sizeof(Box));
+					return 0;
+				}
+
+				cmpRects = detector.detect_differences(imgLiveFindCrop,
+					imgTempCrop,
+					0.7f,		 // difference_threshold (对应Python版本)
+					0.7f,        // roi_diff_threshold (对应Python版本)
+					500,         // min_contour_area (对应Python版本)
+					cv::Size(224, 224)  // target_img_size (对应Python版本)
+				);
+
+				std::cout << "保存: 实时图片样本匹配截图" << std::endl;
+				saveimage(outCropImagePath, imgLive, imgFindRect, resize);
+
+				//将相邻边距离小于50像素的进行合并，合并后过滤掉面积小于10x10，或者大于部件80% 的区域。
+				//取剩余差异区域中面积最大的一个返回
+				//
+				// 合并矩形
+				cv::Rect merged_rect = merge_rectangles(cmpRects, 50);
+				if (merged_rect.x == 0 && merged_rect.y == 0 && merged_rect.width == 0
+					&& merged_rect.height == 0)
+					return 0;
+
+				//过滤掉面积小于10x10，或者大于部件80%的区域
+				float rect_area = merged_rect.width * merged_rect.height;
+				float box_area = imgLiveFindCrop.cols * imgLiveFindCrop.rows;
+				if (rect_area / box_area > 0.8 || rect_area < 10 * 10) {
+					box->x = 0;
+					box->y = 0;
+					box->w = 0;
+					box->h = 0;
+
+					std::cout << "面积小于0.8 < 10*10" << std::endl;
+					return 0;
+				}
+				printf("合并坐标:%d,%d,%d,%d\n", merged_rect.x, merged_rect.y, merged_rect.width, merged_rect.height);
+				//位置需要匹配到大图中,故而增加截图区域的xy
+				box->x = merged_rect.x + imgFindRect.x;
+				box->y = merged_rect.y + imgFindRect.y;
+				box->w = merged_rect.width;
+				box->h = merged_rect.height;
+
+				stepTimer.push_end("异动", os_time_ms());
+
+				//转base64
+				{
+					//两个小图片
+					//模板图片转字符串
+					std::vector<uchar> jpgTmp = cvMat2jpgString(imgTempCrop);
+
+					//匹配图片转小图
+					std::vector<uchar> jpglive = cvMat2jpgString(imgLiveFindCrop);
+
+					std::string jpgB64Tmp = "data:image/jpeg;base64," + Base64Encode(jpgTmp.data(), jpgTmp.size());
+					std::string jpgB64live = "data:image/jpeg;base64," + Base64Encode(jpglive.data(), jpglive.size());
+
+					// 分配堆内存并复制字符串（C# 负责释放）
+					char* str1 = (char*)malloc(jpgB64Tmp.size() + 1);
+					if (str1) {
+						memset(str1, 0, jpgB64Tmp.size() + 1);
+						memcpy(str1, jpgB64Tmp.c_str(), jpgB64Tmp.size() + 1);
+					};
+
+					char* str2 = (char*)malloc(jpgB64live.size() + 1);
+					if (str2) {
+						memset(str2, 0, jpgB64live.size() + 1);
+						memcpy(str2, jpgB64live.c_str(), jpgB64live.size() + 1);
+					};
+
+					*oImgTmpB64 = str1;
+					*oImgLiveB64 = str2;
+				}
+
+				//需要判断box是否在范围内
+				// 检查左上角
+				if (box->x < rectBox.x || box->y < rectBox.y) {
+					//printf("异动坐标超过yolo坐标 左上角:%d,%d != yolo:%d,%d\n", box->x, box->y, rectBox.x, rectBox.y);
+					//return -6;
+				}
+
+				// 检查右下角
+				if (box->x + box->w > rectBox.x + rectBox.width || box->y + box->h > rectBox.y + rectBox.height) {
+					//printf("异动坐标超过yolo坐标 右下角 %d,%d != yolo:%d,%d", box->x + box->w, box->y + box->h, rectBox.x + rectBox.width, rectBox.y + rectBox.height);
+					//return -6;
+				}
+			}
+			stepTimer.print_step_times();
+		}
+		catch (const std::exception& e) {
+			std::cerr << "发生异常: Exception in lxImageFind: " << e.what() << std::endl;
+			return -1; // 返回错误代码
+		}
+
+		return 1;
+	}
+
+
+LXAPI int lxImageYolo2Rect(const char *srcpath, float yolo_x, float yolo_y, float yolo_w,
+		float yolo_h, int *x, int *y, int *w, int *h) {
+	cv::Mat src1 = cv::imread(srcpath);
+	int x1, y1, box_width, box_height;
+	yolo2rect(yolo_x, yolo_y, yolo_w, yolo_h, src1.cols, src1.rows, x1, y1, box_width, box_height);
+	*x = x1;
+	*y = y1;
+	*w = box_width;
+	*h = box_height;
+	return 0;
+}
+
+LXAPI int lxImageDraw(const char *srcpath, int x, int y, int w, int h, const char *outpath) {
+	try {
+		cv::Mat img = cv::imread(srcpath);
+		cv::Rect rect(x, y, w, h);
+		cv::rectangle(img, rect, cv::Scalar(0, 255, 255), 2);
+		cv::imwrite(outpath, img);
+		return 1;
+	} catch (const std::exception &e) {
+		std::cerr << "错误: " << e.what() << std::endl;
+		return -1;
+	}
+	return 0;
+}
+
+LXAPI int lxImageCrop(const char *srcpath, int x, int y, int w, int h, const char *outpath) {
+	try {
+		cv::Mat img1 = cv::imread(srcpath);
+		cv::imwrite(outpath, img1(cv::Rect(x, y, w, h)).clone());
+		return 1;
+	} catch (const std::exception &e) {
+		std::cerr << "错误: " << e.what() << std::endl;
+		return -1;
+	}
+	return 0;
+}
+
+LXAPI int lxImageOnnxLDC(const char *srcpath, const char *outpath) {
+	LDC ldcnet("LDC_640x360.om");
+	cv::Mat timg = cv::imread(srcpath);
+
+	cv::Mat timg_average_image;
+	ldcnet.detect(timg, timg_average_image);
+	cv::imwrite(outpath, timg_average_image);
+	return 0;
+}
+
+}

@@ -1,0 +1,169 @@
+#include <string>
+#include <iostream>
+#include <thread>
+#include <vector>
+#include <fstream>
+
+struct Box {
+	int x;
+	int y;
+	int w;
+	int h;
+};
+
+//@simres: 0~1
+//return 0:success !0: error
+extern "C" int lxImageCmp(const char *path1, const char *path2, float threshold,
+		float *simres, Box *box);
+extern "C" int lxImageCmp2(const char *img_path1, const char *img_path2,
+		float yolo_x, float yolo_y, float yolo_w, float yolo_h, float threshold,
+		float *simres, Box *box, const char *cropPath, int resize);
+
+extern "C" int lxImageCmp3(const char *img_path1, const char *img_path2,
+		float yolo_x, float yolo_y, float yolo_w, float yolo_h, float threshold,
+		float *simres, Box *box, const char *cropPath, int resize);
+
+extern "C" int lxImageFind(const char *liveImagePath, const char *tempImagePath,
+		float yolo_x, float yolo_y, float yolo_w, float yolo_h, float threshold,
+		float *simres, Box *box, const char *outCropImagePath, int resize);
+
+extern "C" int lxImageCmpOnnx(const char* liveImagePath,
+	const char* tempImagePath,
+	float yolo_x, float yolo_y, float yolo_w, float yolo_h,
+	float threshold,
+	float* simres,
+	Box * box,
+	const char* outCropImagePath,
+	int resize,
+	float liveRectYolo[4],
+	char** oImgLiveB64,
+	char** oImgTmpB64,
+	int generate_base64);
+
+extern "C" int lxImageDraw(const char* srcpath, int x, int y, int w, int h, const char* outpath);
+
+extern "C" int lxImageYolo2Rect(const char* srcpath,
+	float yolo_x, float yolo_y, float yolo_w, float yolo_h,
+	int* x, int* y, int* w, int* h
+);
+
+extern "C" int lxUninit();
+
+struct YoloRect {
+    int class_id;
+    float x_center;
+    float y_center;
+    float width;
+    float height;
+};
+
+std::vector<YoloRect> loadYoloRects(const std::string& file_path) {
+    std::vector<YoloRect> rects;
+    std::ifstream file(file_path);
+    if (!file.is_open()) {
+        std::cerr << "无法打开文件: " << file_path << std::endl;
+        return rects;
+    }
+
+    YoloRect rect;
+    while (file >> rect.class_id
+                >> rect.x_center
+                >> rect.y_center
+                >> rect.width
+                >> rect.height) {
+        rects.push_back(rect);
+    }
+
+    file.close();
+    return rects;
+}
+
+int main(int c, char** argv) {
+	float simres;
+	struct Box box;
+
+#ifdef _WIN32
+	system("CHCP 65001");
+	system("ECHO %PATH%");
+#endif
+
+	std::string path = "20250731/yolo.txt";
+
+	int loopindex = 0;
+	auto program_start_time = std::chrono::high_resolution_clock::now();
+	while (true) {
+		std::cout << "================= 开始第 " << loopindex << " 轮循环测试 =================" << std::endl;
+		
+		std::vector<YoloRect> yrects = loadYoloRects(path);
+		for (int i = 0; i < yrects.size(); i++)
+		{
+			std::string srcimg = "20250731/live1.jpg";
+			std::string tmpimg = "20250731/temp.jpg";
+			std::string outimg = srcimg + "_crop_" + std::to_string(i) + ".jpg";
+
+			std::cout << "================比较yolo标签第" << i << "个========" << std::endl;
+			char *img1 = NULL;
+			char *img2 = NULL;
+			float yolopoint[4];
+
+			auto start_time = std::chrono::high_resolution_clock::now();
+			int ret = lxImageCmpOnnx(
+				srcimg.c_str(),
+				tmpimg.c_str(),
+				yrects[i].x_center, yrects[i].y_center, yrects[i].width, yrects[i].height,
+				0.70f,
+				&simres, &box,
+				outimg.c_str(), 640,
+				yolopoint,
+				&img1, &img2,
+				0 // 测试时不生成base64
+			);
+			auto end_time = std::chrono::high_resolution_clock::now();
+			auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
+			std::cout << "[性能统计] lxImageCmpOnnx 总耗时: " << duration.count() << " 毫秒" << std::endl;
+
+			if (img1)
+				free(img1);
+			if (img2)
+				free(img2);
+
+			std::cout << "------- lxImageCmpOnnx ret=" << ret << std::endl;
+			std::cout << "simres=" << simres << std::endl;
+			std::cout << "box=" << box.x << "," << box.y << "," << box.w << "," << box.h << std::endl;
+
+			std::string  drawimg = srcimg + "_" + std::to_string(i) + ".yolo.jpg";
+
+			int x, y, w, h;
+			lxImageYolo2Rect(srcimg.c_str(), yrects[i].x_center, yrects[i].y_center,
+				yrects[i].width, yrects[i].height, &x, &y, &w, &h);
+
+			lxImageDraw(srcimg.c_str(), x, y, w, h, drawimg.c_str());
+
+			drawimg += "_draw.jpg";
+			lxImageDraw(srcimg.c_str(), box.x, box.y, box.w, box.h, drawimg.c_str());
+		}
+		
+		auto current_time = std::chrono::high_resolution_clock::now();
+		auto total_duration = std::chrono::duration_cast<std::chrono::milliseconds>(current_time - program_start_time);
+		long long total_ms = total_duration.count();
+		long long total_s = total_ms / 1000;
+		long long hours = total_s / 3600;
+		long long minutes = (total_s % 3600) / 60;
+		long long seconds = total_s % 60;
+
+		std::cout << "============ 第 " << loopindex << " 轮测试结束，程序总运行耗时: " 
+				  << hours << "小时 " << minutes << "分钟 " << seconds << "秒 (" << total_ms << " 毫秒) ============" << std::endl;
+		
+		loopindex++;
+	}
+
+
+	std::cout<<"===============test完成================"<<std::endl;
+	//int x, y, w, h;
+	//lxImageYolo2Rect("test1.jpg", 0.500000, 0.542414, 1.000000, 0.915171, &x, &y, &w, &h);
+
+	// 显式释放模型资源，确保干净退出
+	lxUninit();
+	
+	return 0;
+}

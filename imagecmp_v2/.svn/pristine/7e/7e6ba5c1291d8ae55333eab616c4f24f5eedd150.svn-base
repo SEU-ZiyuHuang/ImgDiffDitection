@@ -1,0 +1,404 @@
+#include "deep_difference_detector.h"
+
+#include <algorithm>
+#include <chrono>
+#include <cstring>
+#include <fstream>
+#include <iostream>
+#include <sstream>
+#include <stdexcept>
+
+static cv::Mat normalizeMat(const cv::Mat& input) {
+    cv::Mat floatInput;
+    if (input.depth() != CV_32F) {
+        input.convertTo(floatInput, CV_32F);
+    } else {
+        floatInput = input.clone();
+    }
+
+    cv::Mat norm;
+    cv::multiply(floatInput, floatInput, norm);
+    cv::reduce(norm, norm, 1, cv::REDUCE_SUM);
+    cv::sqrt(norm, norm);
+
+    cv::Mat mask = (norm == 0);
+    norm.setTo(1.0, mask);
+
+    cv::Mat result(floatInput.size(), CV_32F);
+    for (int i = 0; i < floatInput.rows; ++i) {
+        float* pInput = floatInput.ptr<float>(i);
+        float* pResult = result.ptr<float>(i);
+        float n = norm.at<float>(i, 0);
+        for (int j = 0; j < floatInput.cols; ++j) {
+            pResult[j] = pInput[j] / n;
+        }
+    }
+
+    return result;
+}
+
+static float cosineSimilarity(const cv::Mat& mat1, const cv::Mat& mat2) {
+    if (mat1.cols != mat2.cols) {
+        throw std::invalid_argument("Matrices must have the same number of columns");
+    }
+    return mat1.dot(mat2);
+}
+
+static float computeGlobalSimilarity(const cv::Mat& feat_map1_global, const cv::Mat& feat_map2_global) {
+    cv::Mat flat1 = feat_map1_global.reshape(1, feat_map1_global.rows * feat_map1_global.cols * feat_map1_global.channels());
+    cv::Mat flat2 = feat_map2_global.reshape(1, feat_map2_global.rows * feat_map2_global.cols * feat_map2_global.channels());
+
+    flat1 = flat1.t();
+    flat2 = flat2.t();
+
+    cv::Mat feat_vec1_global = normalizeMat(flat1);
+    cv::Mat feat_vec2_global = normalizeMat(flat2);
+
+    return cosineSimilarity(feat_vec1_global, feat_vec2_global);
+}
+
+DeepDifferenceDetector::DeepDifferenceDetector(const std::string& om_model_path, uint32_t device_id)
+    : device_id_(device_id), ascend_(device_id_), model_(ascend_, om_model_path) {}
+
+std::vector<cv::Rect> DeepDifferenceDetector::readYoloFormatToRects(const std::string& filePath, int imageWidth, int imageHeight) {
+    std::vector<cv::Rect> rects;
+    std::ifstream file(filePath);
+    if (!file.is_open()) {
+        throw std::runtime_error("无法打开文件: " + filePath);
+    }
+
+    std::string line;
+    while (std::getline(file, line)) {
+        std::istringstream iss(line);
+        int classId = 0;
+        float x_center = 0;
+        float y_center = 0;
+        float width = 0;
+        float height = 0;
+
+        if (!(iss >> classId >> x_center >> y_center >> width >> height)) {
+            continue;
+        }
+
+        int abs_width = static_cast<int>(width * imageWidth);
+        int abs_height = static_cast<int>(height * imageHeight);
+        int abs_x = static_cast<int>((x_center * imageWidth) - (abs_width / 2));
+        int abs_y = static_cast<int>((y_center * imageHeight) - (abs_height / 2));
+
+        abs_x = std::max(0, abs_x);
+        abs_y = std::max(0, abs_y);
+        abs_width = std::min(abs_width, imageWidth - abs_x);
+        abs_height = std::min(abs_height, imageHeight - abs_y);
+
+        rects.emplace_back(abs_x, abs_y, abs_width, abs_height);
+    }
+
+    return rects;
+}
+
+cv::Rect DeepDifferenceDetector::templateMatching(const cv::Mat& largeImg, const cv::Mat& smallImg, double& maxVal, int method) {
+    if (largeImg.empty() || smallImg.empty()) {
+        throw std::invalid_argument("输入图像不能为空");
+    }
+    if (smallImg.rows > largeImg.rows || smallImg.cols > largeImg.cols) {
+        throw std::invalid_argument("模板图像不能大于搜索图像");
+    }
+
+    // 金字塔匹配优化：缩小图片以加速
+    int scale = 1;
+    // 如果大图分辨率非常大，按比例缩小（比如超过 1000 像素，就缩小 4 倍）
+    if (largeImg.cols > 1000 || largeImg.rows > 1000) {
+        scale = 4;
+    }
+
+    cv::Mat searchImg, tmplImg;
+    if (scale > 1) {
+        cv::resize(largeImg, searchImg, cv::Size(largeImg.cols / scale, largeImg.rows / scale));
+        cv::resize(smallImg, tmplImg, cv::Size(smallImg.cols / scale, smallImg.rows / scale));
+    } else {
+        searchImg = largeImg;
+        tmplImg = smallImg;
+    }
+
+    cv::Mat result;
+    int result_cols = searchImg.cols - tmplImg.cols + 1;
+    int result_rows = searchImg.rows - tmplImg.rows + 1;
+    if (result_cols <= 0 || result_rows <= 0) {
+        // 如果缩放后模板比图还大，退回原图
+        searchImg = largeImg;
+        tmplImg = smallImg;
+        scale = 1;
+        result_cols = searchImg.cols - tmplImg.cols + 1;
+        result_rows = searchImg.rows - tmplImg.rows + 1;
+    }
+
+    result.create(result_rows, result_cols, CV_32FC1);
+    cv::matchTemplate(searchImg, tmplImg, result, method);
+
+    double minVal = 0;
+    cv::Point minLoc, maxLoc;
+    cv::minMaxLoc(result, &minVal, &maxVal, &minLoc, &maxLoc);
+
+    cv::Point matchLoc;
+    if (method == cv::TM_SQDIFF || method == cv::TM_SQDIFF_NORMED) {
+        matchLoc = minLoc;
+    } else {
+        matchLoc = maxLoc;
+    }
+
+    // 粗略坐标还原
+    int rough_x = matchLoc.x * scale;
+    int rough_y = matchLoc.y * scale;
+
+    if (scale == 1) {
+        return cv::Rect(rough_x, rough_y, smallImg.cols, smallImg.rows);
+    }
+
+    // 精细匹配：在原图粗略位置附近（± 2*scale）提取 ROI 进行二次精确匹配
+    int offset = scale * 2;
+    int roi_x = std::max(0, rough_x - offset);
+    int roi_y = std::max(0, rough_y - offset);
+    int roi_w = std::min(largeImg.cols - roi_x, smallImg.cols + 2 * offset);
+    int roi_h = std::min(largeImg.rows - roi_y, smallImg.rows + 2 * offset);
+
+    cv::Mat roiLargeImg = largeImg(cv::Rect(roi_x, roi_y, roi_w, roi_h));
+
+    // 二次匹配
+    cv::Mat fine_result;
+    cv::matchTemplate(roiLargeImg, smallImg, fine_result, method);
+    cv::minMaxLoc(fine_result, &minVal, &maxVal, &minLoc, &maxLoc);
+
+    cv::Point fineMatchLoc;
+    if (method == cv::TM_SQDIFF || method == cv::TM_SQDIFF_NORMED) {
+        fineMatchLoc = minLoc;
+    } else {
+        fineMatchLoc = maxLoc;
+    }
+
+    // 计算最终准确的原图坐标
+    int final_x = roi_x + fineMatchLoc.x;
+    int final_y = roi_y + fineMatchLoc.y;
+
+    return cv::Rect(final_x, final_y, smallImg.cols, smallImg.rows);
+}
+
+std::pair<cv::Mat, cv::Mat> DeepDifferenceDetector::preprocess_image(const cv::Mat& img, const cv::Size& target_size) {
+    if (img.empty()) {
+        throw std::runtime_error("无法读取图像文件");
+    }
+
+    cv::Mat original_color_img = img.clone();
+    cv::Mat img_3_channel;
+    cv::cvtColor(img, img_3_channel, cv::COLOR_BGR2RGB);
+
+    cv::Mat resized_rgb;
+    cv::resize(img_3_channel, resized_rgb, target_size, 0, 0, cv::INTER_AREA);
+
+    cv::Mat cv_img;
+    cv::resize(original_color_img, cv_img, target_size);
+
+    return {resized_rgb, cv_img};
+}
+
+cv::Mat DeepDifferenceDetector::extract_features(const cv::Mat& pil_image) {
+    cv::Mat float_img;
+    pil_image.convertTo(float_img, CV_32FC3, 1.0 / 255.0);
+
+    std::vector<cv::Mat> channels;
+    cv::split(float_img, channels);
+    for (int c = 0; c < 3; ++c) {
+        channels[c] = (channels[c] - mean_[c]) / std_dev_[c];
+    }
+
+    std::vector<float> input_tensor_values;
+    input_tensor_values.reserve(1 * 3 * pil_image.rows * pil_image.cols);
+    for (int c = 0; c < 3; ++c) {
+        for (int h = 0; h < pil_image.rows; ++h) {
+            for (int w = 0; w < pil_image.cols; ++w) {
+                input_tensor_values.push_back(channels[c].at<float>(h, w));
+            }
+        }
+    }
+
+    if (input_tensor_values.size() * sizeof(float) != model_.input_size(0)) {
+        std::cerr << "DeepDifferenceDetector input size mismatch" << std::endl;
+        std::exit(-1);
+    }
+
+    std::memcpy(model_.input_host(0), input_tensor_values.data(), model_.input_size(0));
+    model_.Execute();
+
+    float* output_data = reinterpret_cast<float*>(model_.output_host(0));
+    const aclmdlIODims& od = model_.output_dims(0);
+    if (od.dimCount < 4) {
+        std::cerr << "DeepDifferenceDetector output dims invalid" << std::endl;
+        std::exit(-1);
+    }
+
+    int batch_size = static_cast<int>(od.dims[0]);
+    int channels_out = static_cast<int>(od.dims[1]);
+    int height_out = static_cast<int>(od.dims[2]);
+    int width_out = static_cast<int>(od.dims[3]);
+    if (batch_size != 1 || channels_out <= 0 || height_out <= 0 || width_out <= 0) {
+        std::cerr << "DeepDifferenceDetector output dims unexpected" << std::endl;
+        std::exit(-1);
+    }
+
+    cv::Mat feat_map(width_out * height_out, channels_out, CV_32F);
+    for (int c = 0; c < channels_out; ++c) {
+        for (int h = 0; h < height_out; ++h) {
+            for (int w = 0; w < width_out; ++w) {
+                int src_idx = c * height_out * width_out + h * width_out + w;
+                int dst_idx = h * width_out + w;
+                feat_map.at<float>(dst_idx, c) = output_data[src_idx];
+            }
+        }
+    }
+    return feat_map;
+}
+
+cv::Mat DeepDifferenceDetector::compute_dense_difference(const cv::Mat& feat_map1, const cv::Mat& feat_map2,
+                                                         const cv::Size& original_img_shape) {
+    cv::Mat feat1 = feat_map1;
+    cv::Mat feat2 = feat_map2;
+
+    if (feat1.size() != feat2.size()) {
+        cv::resize(feat1, feat1, feat2.size(), 0, 0, cv::INTER_LINEAR);
+    }
+
+    cv::Mat feat1_norm = cv::Mat::zeros(feat1.size(), CV_32F);
+    cv::Mat feat2_norm = cv::Mat::zeros(feat2.size(), CV_32F);
+
+    for (int i = 0; i < feat1.rows; ++i) {
+        cv::Mat row1 = feat1.row(i);
+        cv::Mat row2 = feat2.row(i);
+
+        float norm1 = cv::norm(row1, cv::NORM_L2);
+        float norm2 = cv::norm(row2, cv::NORM_L2);
+
+        cv::Mat norm_row1, norm_row2;
+        if (norm1 > 1e-8) {
+            norm_row1 = row1 / norm1;
+        } else {
+            norm_row1 = cv::Mat::zeros(row1.size(), CV_32F);
+        }
+
+        if (norm2 > 1e-8) {
+            norm_row2 = row2 / norm2;
+        } else {
+            norm_row2 = cv::Mat::zeros(row2.size(), CV_32F);
+        }
+
+        norm_row1.copyTo(feat1_norm.row(i));
+        norm_row2.copyTo(feat2_norm.row(i));
+    }
+
+    cv::Mat diff_map;
+    cv::absdiff(feat1_norm, feat2_norm, diff_map);
+
+    cv::Mat mean_diff = cv::Mat::zeros(diff_map.rows, 1, CV_32F);
+    for (int i = 0; i < diff_map.rows; ++i) {
+        cv::Scalar row_mean = cv::mean(diff_map.row(i));
+        mean_diff.at<float>(i, 0) = static_cast<float>(row_mean[0]);
+    }
+
+    int feat_h = static_cast<int>(std::sqrt(feat_map1.rows));
+    int feat_w = feat_map1.rows / feat_h;
+    (void)feat_w;
+    cv::Mat spatial_diff = mean_diff.reshape(1, feat_h);
+
+    double min_val = 0;
+    double max_val = 0;
+    cv::minMaxLoc(spatial_diff, &min_val, &max_val);
+
+    cv::Mat diff_map_normalized = (spatial_diff - min_val) / (max_val - min_val + 1e-8);
+
+    cv::Mat upsampled_diff;
+    cv::resize(diff_map_normalized, upsampled_diff, original_img_shape, 0, 0, cv::INTER_LINEAR);
+    return upsampled_diff;
+}
+
+float DeepDifferenceDetector::computer_sim(const cv::Mat& srcimg1, const cv::Mat& srcimg2, const cv::Size& target_img_size) {
+    auto img1pre = preprocess_image(srcimg1, target_img_size);
+    auto img2pre = preprocess_image(srcimg2, target_img_size);
+
+    cv::Mat feat_map1 = extract_features(img1pre.first);
+    cv::Mat feat_map2 = extract_features(img2pre.first);
+
+    float simplus = computeGlobalSimilarity(feat_map1, feat_map2);
+    std::cout << "Global similarity: " << simplus << std::endl;
+    return simplus;
+}
+
+std::vector<cv::Rect> DeepDifferenceDetector::detect_differences(const cv::Mat& srcimg1,
+                                                                 const cv::Mat& srcimg2,
+                                                                 float difference_threshold,
+                                                                 float roi_diff_threshold,
+                                                                 int min_contour_area,
+                                                                 const cv::Size& target_img_size) {
+    int srcw = srcimg1.cols, srch = srcimg1.rows;
+    auto start_total = std::chrono::high_resolution_clock::now();
+
+    auto start_preprocess = std::chrono::high_resolution_clock::now();
+    auto img1pre = preprocess_image(srcimg1, target_img_size);
+    auto img2pre = preprocess_image(srcimg2, target_img_size);
+    auto time_preprocess = std::chrono::high_resolution_clock::now() - start_preprocess;
+
+    auto start_feature = std::chrono::high_resolution_clock::now();
+    cv::Mat feat_map1 = extract_features(img1pre.first);
+    cv::Mat feat_map2 = extract_features(img2pre.first);
+    auto time_feature = std::chrono::high_resolution_clock::now() - start_feature;
+
+    auto start_diff = std::chrono::high_resolution_clock::now();
+    cv::Size original_img_shape(img1pre.second.cols, img1pre.second.rows);
+    cv::Mat diff_map = compute_dense_difference(feat_map1, feat_map2, original_img_shape);
+    auto time_diff = std::chrono::high_resolution_clock::now() - start_diff;
+
+    auto start_contour = std::chrono::high_resolution_clock::now();
+    cv::Mat diff_map_smoothed;
+    cv::GaussianBlur(diff_map, diff_map_smoothed, cv::Size(5, 5), 3);
+
+    cv::Mat binary = diff_map_smoothed > difference_threshold;
+    cv::Mat kernel = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(7, 7));
+    cv::morphologyEx(binary, binary, cv::MORPH_CLOSE, kernel);
+    cv::morphologyEx(binary, binary, cv::MORPH_OPEN, kernel);
+
+    std::vector<std::vector<cv::Point>> contours;
+    cv::findContours(binary, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+
+    int count = 0;
+    std::vector<cv::Rect> tarrects;
+    for (const auto& c : contours) {
+        double area = cv::contourArea(c);
+        if (area > min_contour_area) {
+            cv::Rect rect = cv::boundingRect(c);
+            cv::Mat roi = diff_map(rect);
+            float roi_diff = static_cast<float>(cv::mean(roi)[0]);
+            if (roi_diff > roi_diff_threshold) {
+                int tarcx = static_cast<int>(static_cast<float>(rect.x) / target_img_size.width * srcw);
+                int tarcy = static_cast<int>(static_cast<float>(rect.y) / target_img_size.height * srch);
+                int tarcw = static_cast<int>(static_cast<float>(rect.width) / target_img_size.width * srcw);
+                int tarch = static_cast<int>(static_cast<float>(rect.height) / target_img_size.height * srch);
+                tarrects.push_back(cv::Rect(tarcx, tarcy, tarcw, tarch));
+                count++;
+            }
+        }
+    }
+
+    auto time_contour = std::chrono::high_resolution_clock::now() - start_contour;
+    auto total_time = std::chrono::high_resolution_clock::now() - start_total;
+
+    std::cout << "\n===== 性能统计 =====" << std::endl;
+    std::cout << "图像预处理耗时: " << std::chrono::duration_cast<std::chrono::milliseconds>(time_preprocess).count() << "毫秒"
+              << std::endl;
+    std::cout << "特征提取耗时: " << std::chrono::duration_cast<std::chrono::milliseconds>(time_feature).count() << "毫秒"
+              << std::endl;
+    std::cout << "差异计算耗时: " << std::chrono::duration_cast<std::chrono::milliseconds>(time_diff).count() << "毫秒"
+              << std::endl;
+    std::cout << "轮廓检测耗时: " << std::chrono::duration_cast<std::chrono::milliseconds>(time_contour).count() << "毫秒"
+              << std::endl;
+    std::cout << "总耗时: " << std::chrono::duration_cast<std::chrono::milliseconds>(total_time).count() << "毫秒" << std::endl;
+    std::cout << "检测到 " << count << " 个显著差异区域" << std::endl;
+
+    return tarrects;
+}

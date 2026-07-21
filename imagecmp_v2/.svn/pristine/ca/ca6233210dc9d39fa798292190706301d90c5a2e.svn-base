@@ -1,0 +1,134 @@
+#include <string>
+#include <iostream>
+#include <thread>
+#include <vector>
+#include <fstream>
+
+struct Box {
+	int x;
+	int y;
+	int w;
+	int h;
+};
+
+//@simres: 0~1
+//return 0:success !0: error
+extern "C" int lxImageCmp(const char *path1, const char *path2, float threshold,
+		float *simres, Box *box);
+extern "C" int lxImageCmp2(const char *img_path1, const char *img_path2,
+		float yolo_x, float yolo_y, float yolo_w, float yolo_h, float threshold,
+		float *simres, Box *box, const char *cropPath, int resize);
+
+extern "C" int lxImageCmp3(const char *img_path1, const char *img_path2,
+		float yolo_x, float yolo_y, float yolo_w, float yolo_h, float threshold,
+		float *simres, Box *box, const char *cropPath, int resize);
+
+extern "C" int lxImageFind(const char *liveImagePath, const char *tempImagePath,
+		float yolo_x, float yolo_y, float yolo_w, float yolo_h, float threshold,
+		float *simres, Box *box, const char *outCropImagePath, int resize);
+
+extern "C" int lxImageCmpOnnx(const char* liveImagePath,
+	const char* tempImagePath,
+	float yolo_x, float yolo_y, float yolo_w, float yolo_h,
+	float threshold,
+	float* simres,
+	Box * box,
+	const char* outCropImagePath,
+	int resize,
+	float liveRectYolo[4],
+	char** oImgLiveB64,
+	char** oImgTmpB64);
+
+extern "C" int lxImageDraw(const char* srcpath, int x, int y, int w, int h, const char* outpath);
+
+extern "C" int lxImageYolo2Rect(const char* srcpath,
+	float yolo_x, float yolo_y, float yolo_w, float yolo_h,
+	int* x, int* y, int* w, int* h
+);
+
+struct YoloRect {
+    int class_id;
+    float x_center;
+    float y_center;
+    float width;
+    float height;
+};
+
+std::vector<YoloRect> loadYoloRects(const std::string& file_path) {
+    std::vector<YoloRect> rects;
+    std::ifstream file(file_path);
+    if (!file.is_open()) {
+        std::cerr << "无法打开文件: " << file_path << std::endl;
+        return rects;
+    }
+
+    YoloRect rect;
+    while (file >> rect.class_id
+                >> rect.x_center
+                >> rect.y_center
+                >> rect.width
+                >> rect.height) {
+        rects.push_back(rect);
+    }
+
+    file.close();
+    return rects;
+}
+
+int main(int c, char** argv) {
+	float simres;
+	struct Box box;
+
+#ifdef _WIN32
+	system("CHCP 65001");
+	system("ECHO %PATH%");
+#endif
+
+	std::string path = "20250731/yolo.txt";
+	std::vector<YoloRect> yrects = loadYoloRects(path);
+	for (int i = 0; i < yrects.size(); i++)
+	{
+		std::string srcimg = "20250731/live1.jpg";
+		std::string tmpimg = "20250731/temp.jpg";
+		std::string outimg = srcimg + "_crop_" + std::to_string(i) + ".jpg";
+
+		std::cout << "================比较yolo标签第" << i << "个========" << std::endl;
+		char* img1;
+		char *img2;
+		float yolopoint[4];
+
+		int ret = lxImageCmpOnnx(
+			srcimg.c_str(),
+			tmpimg.c_str(),
+			yrects[i].x_center, yrects[i].y_center, yrects[i].width, yrects[i].height,
+			0.70,
+			&simres, &box,
+			outimg.c_str(), 640,
+			yolopoint,
+			&img1, &img2);
+		if (img1)
+			free(img1);
+		if (img2)
+			free(img2);
+
+		std::cout << "ret=" << ret << std::endl;
+		std::cout << "simres=" << simres << std::endl;
+		std::cout << "box=" << box.x << "," << box.y << "," << box.w << "," << box.h << std::endl;
+
+		std::string  drawimg = srcimg + "_" + std::to_string(i) + ".yolo.jpg";
+
+		int x, y, w, h;
+		lxImageYolo2Rect(srcimg.c_str(), yrects[i].x_center, yrects[i].y_center,
+			yrects[i].width, yrects[i].height, &x, &y, &w, &h);
+
+		lxImageDraw(srcimg.c_str(), x, y, w, h, drawimg.c_str());
+
+		drawimg += "_draw.jpg";
+		lxImageDraw(srcimg.c_str(), box.x, box.y, box.w, box.h, drawimg.c_str());
+	}
+
+	std::cout<<"===============test完成================"<<std::endl;
+	//int x, y, w, h;
+	//lxImageYolo2Rect("test1.jpg", 0.500000, 0.542414, 1.000000, 0.915171, &x, &y, &w, &h);
+	return 0;
+}

@@ -1,0 +1,239 @@
+// SuperPoint + LightGlue 模型输出解析与几何定位实现。
+// 当前 .om 为两图联合输入模型：模型输出关键点、匹配三元组和匹配置信度。
+#include "image_matcher.h"
+
+#include <algorithm>
+#include <cmath>
+#include <cstring>
+#include <iostream>
+
+ImageMatcher::ImageMatcher(const std::string& model_path, uint32_t device_id)
+    : model_path_(model_path), height_(512), width_(512), device_id_(device_id), ascend_(device_id_), model_(ascend_, model_path_) {
+    const aclmdlIODims& in_dims = model_.input_dims(0);
+    if (in_dims.dimCount >= 4) {
+        height_ = static_cast<int>(in_dims.dims[2]);
+        width_ = static_cast<int>(in_dims.dims[3]);
+    }
+}
+
+//灰度图转换
+// 模型约定使用 [0,1] 灰度图；调用方已在 get_matches 中统一缩放到模型输入尺寸。
+std::vector<float> ImageMatcher::preprocess_one(const cv::Mat& img) {
+    cv::Mat gray;
+    if (img.channels() == 3) {
+        cv::cvtColor(img, gray, cv::COLOR_BGR2GRAY);
+    } else {
+        gray = img.clone();
+    }
+    cv::Mat normalized;
+    gray.convertTo(normalized, CV_32F, 1.0 / 255.0);
+
+    std::vector<float> out;
+    out.assign(reinterpret_cast<float*>(normalized.data),
+               reinterpret_cast<float*>(normalized.data) + normalized.total());
+    return out;
+}
+
+// 执行联合匹配模型，并只保留置信度、图像编号、索引范围和几何距离都通过的匹配对。
+MatchResult ImageMatcher::get_matches(const cv::Mat& left_img, const cv::Mat& right_img) {
+    cv::Mat left_img_resize;
+    cv::Mat right_img_resize;
+    cv::resize(left_img, left_img_resize, cv::Size(width_, height_));
+    cv::resize(right_img, right_img_resize, cv::Size(width_, height_));
+
+    auto left = preprocess_one(left_img_resize);
+    auto right = preprocess_one(right_img_resize);
+
+    std::vector<float> input_values;
+    input_values.reserve(left.size() + right.size());
+    input_values.insert(input_values.end(), left.begin(), left.end());
+    input_values.insert(input_values.end(), right.begin(), right.end());
+
+    if (input_values.size() * sizeof(float) != model_.input_size(0)) {
+        std::cerr << "ImageMatcher input size mismatch" << std::endl;
+        std::exit(-1);
+    }
+
+    //执行模型推理
+    std::lock_guard<std::mutex> lock(session_mutex_);
+    std::memcpy(model_.input_host(0), input_values.data(), model_.input_size(0));
+    model_.Execute();
+
+    int64_t* keypoints_data = reinterpret_cast<int64_t*>(model_.output_host(0));
+    int64_t* matches_data = reinterpret_cast<int64_t*>(model_.output_host(1));
+    float* match_scores_data = reinterpret_cast<float*>(model_.output_host(2));
+
+    size_t left_kp_count = static_cast<size_t>(MAX_KEYPOINTS);
+    const aclmdlIODims& kp_dims = model_.output_dims(0);
+    if (kp_dims.dimCount >= 3 && kp_dims.dims[1] > 0) {
+        left_kp_count = static_cast<size_t>(std::min<int64_t>(kp_dims.dims[1], MAX_KEYPOINTS));
+    }
+
+    std::vector<cv::Point2f> kp_left;
+    std::vector<cv::Point2f> kp_right;
+    kp_left.reserve(left_kp_count);
+    kp_right.reserve(left_kp_count);
+
+    for (size_t i = 0; i < left_kp_count; ++i) {
+        kp_left.emplace_back(static_cast<float>(keypoints_data[i * 2]), static_cast<float>(keypoints_data[i * 2 + 1]));
+    }
+    for (size_t i = 0; i < left_kp_count; ++i) {
+        kp_right.emplace_back(static_cast<float>(keypoints_data[left_kp_count * 2 + i * 2]),
+                              static_cast<float>(keypoints_data[left_kp_count * 2 + i * 2 + 1]));
+    }
+
+    size_t num_matches = model_.output_size(1) / (3 * sizeof(int64_t));
+    std::vector<cv::Point2f> matched_left;
+    std::vector<cv::Point2f> matched_right;
+    matched_left.reserve(num_matches);
+    matched_right.reserve(num_matches);
+
+    size_t cnt_score_pass = 0;
+    size_t cnt_imgidx_pass = 0;
+    size_t cnt_index_pass = 0;
+    size_t cnt_distance_pass = 0;
+
+    float min_score = 1e9f;
+    float max_score = -1e9f;
+    double sum_score = 0.0;
+    size_t score_n = 0;
+    const size_t score_count = model_.output_size(2) / sizeof(float);
+
+    for (size_t i = 0; i < num_matches; ++i) {
+        if (i < score_count) {
+            float s = match_scores_data[i];
+            min_score = std::min(min_score, s);
+            max_score = std::max(max_score, s);
+            sum_score += s;
+            score_n += 1;
+        }
+
+        if (match_scores_data[i] <= CONFIDENCE_THRESHOLD) continue;
+        cnt_score_pass++;
+
+        if (matches_data[i * 3] != 0) continue;
+        cnt_imgidx_pass++;
+
+        int64_t left_idx = matches_data[i * 3 + 1];
+        int64_t right_idx = matches_data[i * 3 + 2];
+        if (left_idx < 0 || right_idx < 0) continue;
+        if (static_cast<size_t>(left_idx) >= kp_left.size() || static_cast<size_t>(right_idx) >= kp_right.size()) continue;
+        cnt_index_pass++;
+
+        cv::Point2f pt_left = kp_left[static_cast<size_t>(left_idx)];
+        cv::Point2f pt_right = kp_right[static_cast<size_t>(right_idx)];
+
+        float distance = cv::norm(pt_left - pt_right);
+        if (distance <= DISTANCE_THRESHOLD) {
+            cnt_distance_pass++;
+            matched_left.push_back(pt_left);
+            matched_right.push_back(pt_right);
+        }
+    }
+
+    std::cout << "[ImageMatcher][Debug] kp_count=" << left_kp_count
+              << ", num_matches=" << num_matches
+              << ", score_count=" << score_count
+              << ", thr_score=" << CONFIDENCE_THRESHOLD
+              << ", thr_dist=" << DISTANCE_THRESHOLD
+              << std::endl;
+
+    if (score_n > 0) {
+        std::cout << "[ImageMatcher][Debug] score min=" << min_score
+                  << ", max=" << max_score
+                  << ", mean=" << static_cast<float>(sum_score / static_cast<double>(score_n))
+                  << std::endl;
+    }
+
+    std::cout << "[ImageMatcher][Debug] pass(score)=" << cnt_score_pass
+              << ", pass(img_idx)= " << cnt_imgidx_pass
+              << ", pass(index)=" << cnt_index_pass
+              << ", pass(distance)=" << cnt_distance_pass
+              << ", matched=" << matched_left.size()
+              << std::endl;
+
+    return {kp_left, kp_right, matched_left, matched_right};
+}
+
+cv::Rect ImageMatcher::resizePoint(const cv::Rect& srcRect, int srcW, int srcH, int dstW, int dstH) {
+    float scaleX = static_cast<float>(dstW) / srcW;
+    float scaleY = static_cast<float>(dstH) / srcH;
+
+    int x = static_cast<int>(srcRect.x * scaleX);
+    int y = static_cast<int>(srcRect.y * scaleY);
+    int w = static_cast<int>(srcRect.width * scaleX);
+    int h = static_cast<int>(srcRect.height * scaleY);
+
+    x = std::max(0, x);
+    y = std::max(0, y);
+    w = std::max(0, w);
+    h = std::max(0, h);
+
+    x = std::min(x, dstW - 1);
+    y = std::min(y, dstH - 1);
+    w = std::min(w, dstW - x);
+    h = std::min(h, dstH - y);
+
+    return cv::Rect(x, y, w, h);
+}
+
+// 用全部可靠匹配对估计单应性矩阵 H，并把样本框的四个角投影到实时图。
+// H 可表达局部平移、缩放、旋转及一定的透视变化。
+bool ImageMatcher::feature_match(int x_min, int y_min, int x_max, int y_max, std::vector<cv::Point2f>& matched_kp_l,
+                                 std::vector<cv::Point2f>& match_l, std::vector<cv::Point2f>& match_r, cv::Rect& tarrec) {
+    std::cout << "全部特征点总数:" << matched_kp_l.size() << " 匹配特征点:" << match_l.size() << std::endl;
+
+    if (match_l.size() <= static_cast<size_t>(MIN_GLOBAL_MATCHES)) {
+        return false;
+    }
+
+    int w = x_max - x_min;
+    int h = y_max - y_min;
+    int box_area = w * h;
+
+    // 小框沿用缩放后的原框，避免关键点不足时不稳定地估计单应性矩阵。
+    if (box_area <= MAX_BOX_AREA) {
+        tarrec = cv::Rect(x_min, y_min, (x_max - x_min), (y_max - y_min));
+        return true;
+    }
+
+    int matches_in_box = 0;
+    for (const auto& pt : matched_kp_l) {
+        if (pt.x >= x_min && pt.x <= x_max && pt.y >= y_min && pt.y <= y_max) {
+            matches_in_box++;
+        }
+    }
+
+    if (matches_in_box >= MIN_BOX_MATCHES) {
+        cv::Mat H;
+        if (match_l.size() >= static_cast<size_t>(MIN_BOX_MATCHES) && match_r.size() >= static_cast<size_t>(MIN_BOX_MATCHES)) {
+            H = cv::findHomography(match_l, match_r, cv::RANSAC, 0.5);
+        }
+
+        std::vector<cv::Point2f> pts = {cv::Point2f(x_min, y_min), cv::Point2f(x_max, y_min), cv::Point2f(x_max, y_max),
+                                        cv::Point2f(x_min, y_max)};
+        std::vector<cv::Point2f> dst_corners;
+        cv::perspectiveTransform(pts, dst_corners, H);
+
+        int tarxmin = static_cast<int>(dst_corners[0].x);
+        int tarymin = static_cast<int>(dst_corners[0].y);
+        int tarxmax = static_cast<int>(dst_corners[2].x);
+        int tarymax = static_cast<int>(dst_corners[2].y);
+
+        tarrec = cv::Rect(tarxmin, tarymin, (tarxmax - tarxmin), (tarymax - tarymin));
+        return true;
+    }
+
+    tarrec = cv::Rect(0, 0, 0, 0);
+    return false;
+}
+
+bool ImageMatcher::feature_match(cv::Rect srcbox, int bW, int bH, std::vector<cv::Point2f>& matched_kp_l,
+                                 std::vector<cv::Point2f>& match_l, std::vector<cv::Point2f>& match_r, cv::Rect& tarrec) {
+    cv::Rect box = resizePoint(srcbox, bW, bH, width_, height_);
+    return feature_match(box.x, box.y, box.x + box.width, box.y + box.height, matched_kp_l, match_l, match_r, tarrec);
+}
+
+cv::Rect ImageMatcher::outRect(cv::Rect srcRect, int dstW, int dstH) {
+    return resizePoint(srcRect, width_, height_, dstW, dstH);
+}
