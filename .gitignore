@@ -1,0 +1,11 @@
+# GitHub rejects files larger than 100 MiB.
+/all_test/
+/all_test.zip
+/third_party/onnxruntime-win-x64-1.26.0/lib/onnxruntime.pdb
+/third_party/opencv-4.12.0/opencv/build/x64/vc16/bin/opencv_world4120d.pdb
+/third_party/opencv-4.12.0-windows.exe
+/build-onnx/bin/Release/opencv_world4120d.dll
+/third_party/opencv-4.12.0/opencv/build/x64/vc16/bin/opencv_world4120d.dll
+
+# Do not publish certificate key material from third-party samples.
+**/*_TemporaryKey.pfx
