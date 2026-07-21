@@ -102,6 +102,24 @@ if(IMAGECMP_USE_ONNXRUNTIME)
             BUILD_RPATH "$ORIGIN:$ORIGIN/libs"
             INSTALL_RPATH "$ORIGIN:$ORIGIN/libs")
     endif()
+
+    # 独立于旧 C ABI 的模型治理检查。它在任何检测链路使用模型前验证
+    # 已登记的哈希、张量契约及确定性参考推理，便于 CI 或发布前人工运行。
+    add_executable(onnx_model_contract_check onnx_model_contract_check.cpp)
+    target_include_directories(onnx_model_contract_check PRIVATE "${ONNXRUNTIME_INCLUDE_DIR}")
+    target_link_libraries(onnx_model_contract_check PRIVATE "${ONNXRUNTIME_LIBRARY}")
+    if(WIN32 AND ONNXRUNTIME_DLL)
+        add_custom_command(TARGET onnx_model_contract_check POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${ONNXRUNTIME_DLL}" "$<TARGET_FILE_DIR:onnx_model_contract_check>")
+    endif()
+    set(IMAGECMP_MODEL_DIR "${CMAKE_CURRENT_SOURCE_DIR}/.." CACHE PATH
+        "Directory containing the governed ONNX model files")
+    add_custom_target(verify_onnx_model_contracts
+        COMMAND $<TARGET_FILE:onnx_model_contract_check> --model-dir "${IMAGECMP_MODEL_DIR}"
+        DEPENDS onnx_model_contract_check
+        WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
+        COMMENT "Verifying governed ONNX model files and reference inference")
 else()
     # 原始 Ascend 版：三个模型由 yidong_main.cpp 以 .om 文件形式加载。
     add_library(${PROJECT_NAME} SHARED
