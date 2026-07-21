@@ -26,6 +26,7 @@ namespace imagecmp {
 namespace {
 
 constexpr double kNotAvailable = std::numeric_limits<double>::quiet_NaN();
+constexpr double kRoiBoundaryTolerance = 0.01;
 
 struct Roi {
     std::string category;
@@ -54,6 +55,7 @@ struct CaseRecord {
     std::vector<std::string> component_categories;
     std::map<std::string, RoiGeometry> roi_geometry_by_category;
     std::vector<std::string> errors;
+    std::vector<std::string> warnings;
     CaseStatus status = CaseStatus::kIncomplete;
 
     std::string standard_format;
@@ -65,6 +67,7 @@ struct CaseRecord {
     int live_height = 0;
     int live_channels = 0;
     std::size_t roi_count = 0;
+    std::size_t roi_boundary_normalized_lines = 0;
     bool image_analysis_complete = false;
 
     double standard_brightness = kNotAvailable;
@@ -105,6 +108,8 @@ struct GroupAccumulator {
     std::size_t valid_cases = 0;
     std::size_t incomplete_cases = 0;
     std::size_t invalid_cases = 0;
+    std::size_t roi_boundary_normalized_cases = 0;
+    std::size_t roi_boundary_normalized_lines = 0;
     std::size_t homography_available_cases = 0;
     std::size_t ecc_converged_cases = 0;
     std::size_t valid_overlap_available_cases = 0;
@@ -159,7 +164,8 @@ std::string trim(const std::string& value) {
     return value.substr(first, last - first + 1);
 }
 
-std::vector<Roi> readRois(const std::filesystem::path& path, std::vector<std::string>& errors) {
+std::vector<Roi> readRois(const std::filesystem::path& path, std::vector<std::string>& errors,
+                          std::vector<std::string>& warnings) {
     std::ifstream input(path);
     if (!input) {
         errors.emplace_back("cannot read ROI file");
@@ -178,12 +184,37 @@ std::vector<Roi> readRois(const std::filesystem::path& path, std::vector<std::st
         std::string surplus;
         std::istringstream values(line);
         if (!(values >> roi.category >> roi.center_x >> roi.center_y >> roi.width >> roi.height) ||
-            (values >> surplus) || roi.width <= 0.0 || roi.height <= 0.0 || roi.center_x < 0.0 ||
-            roi.center_x > 1.0 || roi.center_y < 0.0 || roi.center_y > 1.0 ||
-            roi.center_x - roi.width / 2.0 < 0.0 || roi.center_x + roi.width / 2.0 > 1.0 ||
-            roi.center_y - roi.height / 2.0 < 0.0 || roi.center_y + roi.height / 2.0 > 1.0) {
+            (values >> surplus) || !std::isfinite(roi.center_x) || !std::isfinite(roi.center_y) ||
+            !std::isfinite(roi.width) || !std::isfinite(roi.height) || roi.width <= 0.0 ||
+            roi.height <= 0.0) {
             errors.emplace_back("invalid ROI at line " + std::to_string(lineNumber));
             continue;
+        }
+        const double left = roi.center_x - roi.width / 2.0;
+        const double right = roi.center_x + roi.width / 2.0;
+        const double top = roi.center_y - roi.height / 2.0;
+        const double bottom = roi.center_y + roi.height / 2.0;
+        if (left < -kRoiBoundaryTolerance || right > 1.0 + kRoiBoundaryTolerance ||
+            top < -kRoiBoundaryTolerance || bottom > 1.0 + kRoiBoundaryTolerance) {
+            errors.emplace_back("invalid ROI at line " + std::to_string(lineNumber));
+            continue;
+        }
+
+        const double normalizedLeft = std::clamp(left, 0.0, 1.0);
+        const double normalizedRight = std::clamp(right, 0.0, 1.0);
+        const double normalizedTop = std::clamp(top, 0.0, 1.0);
+        const double normalizedBottom = std::clamp(bottom, 0.0, 1.0);
+        if (normalizedRight <= normalizedLeft || normalizedBottom <= normalizedTop) {
+            errors.emplace_back("invalid ROI at line " + std::to_string(lineNumber));
+            continue;
+        }
+        if (normalizedLeft != left || normalizedRight != right || normalizedTop != top ||
+            normalizedBottom != bottom) {
+            warnings.emplace_back("ROI boundary normalized at line " + std::to_string(lineNumber));
+            roi.center_x = (normalizedLeft + normalizedRight) / 2.0;
+            roi.center_y = (normalizedTop + normalizedBottom) / 2.0;
+            roi.width = normalizedRight - normalizedLeft;
+            roi.height = normalizedBottom - normalizedTop;
         }
         rois.push_back(std::move(roi));
     }
@@ -502,6 +533,10 @@ void addRecord(GroupAccumulator& group, const CaseRecord& record) {
     if (record.valid_overlap_available) {
         ++group.valid_overlap_available_cases;
     }
+    if (record.roi_boundary_normalized_lines != 0) {
+        ++group.roi_boundary_normalized_cases;
+        group.roi_boundary_normalized_lines += record.roi_boundary_normalized_lines;
+    }
     for (const auto& entry : metricsFor(record)) {
         group.metrics[entry.first].insert(group.metrics[entry.first].end(), entry.second.begin(), entry.second.end());
     }
@@ -634,6 +669,9 @@ void writeGroup(std::ostream& output, const std::string& value, const GroupAccum
            << "  \"valid_cases\": " << group.valid_cases << ",\n" << indent
            << "  \"incomplete_cases\": " << group.incomplete_cases << ",\n" << indent
            << "  \"invalid_cases\": " << group.invalid_cases << ",\n" << indent
+           << "  \"roi_boundary_normalization\": {\"cases\": "
+           << group.roi_boundary_normalized_cases << ", \"lines\": "
+           << group.roi_boundary_normalized_lines << "},\n" << indent
            << "  \"alignment_evidence\": {\"homography_available_cases\": "
            << group.homography_available_cases << ", \"ecc_converged_cases\": "
            << group.ecc_converged_cases << ", \"valid_overlap_available_cases\": "
@@ -703,7 +741,7 @@ void writeCaseReport(const std::filesystem::path& path, const std::vector<CaseRe
     if (!output) {
         throw std::runtime_error("cannot write per-case report");
     }
-    output << "case,case_type,component_categories,status,errors,standard_format,live_format,"
+    output << "case,case_type,component_categories,status,errors,warnings,roi_boundary_normalized_lines,standard_format,live_format,"
               "standard_width,standard_height,standard_channels,live_width,live_height,live_channels,roi_count,"
               "standard_brightness,live_brightness,standard_contrast,live_contrast,standard_sharpness,live_sharpness,"
               "brightness_delta,contrast_delta,sharpness_delta,raw_luma_mad,aspect_ratio_delta,mean_roi_relative_area,"
@@ -722,6 +760,8 @@ void writeCaseReport(const std::filesystem::path& path, const std::vector<CaseRe
         output << ',';
         writeCsvValue(output, join(record.errors, "; "));
         output << ',';
+        writeCsvValue(output, join(record.warnings, "; "));
+        output << ',' << record.roi_boundary_normalized_lines << ',';
         writeCsvValue(output, record.standard_format);
         output << ',';
         writeCsvValue(output, record.live_format);
@@ -763,6 +803,7 @@ void writeGroupReport(const std::filesystem::path& path,
         throw std::runtime_error("cannot write grouped report");
     }
     output << "group_dimension,group_value,case_count,valid_cases,incomplete_cases,invalid_cases,"
+              "roi_boundary_normalized_cases,roi_boundary_normalized_lines,"
               "homography_available_cases,ecc_converged_cases,valid_overlap_available_cases,"
               "mean_raw_luma_mad,mean_feature_match_count,mean_inlier_rate,mean_reprojection_error_pixels,"
               "mean_spatial_coverage,mean_ecc_correlation,mean_valid_overlap_ratio\n";
@@ -774,7 +815,8 @@ void writeGroupReport(const std::filesystem::path& path,
             output << ',';
             writeCsvValue(output, entry.first);
             output << ',' << group.case_count << ',' << group.valid_cases << ',' << group.incomplete_cases << ','
-                   << group.invalid_cases << ',' << group.homography_available_cases << ','
+                   << group.invalid_cases << ',' << group.roi_boundary_normalized_cases << ','
+                   << group.roi_boundary_normalized_lines << ',' << group.homography_available_cases << ','
                    << group.ecc_converged_cases << ',' << group.valid_overlap_available_cases << ',';
             const std::array<double, 7> means = {
                 distributionMean(group, "raw_luma_mad"), distributionMean(group, "feature_match_count"),
@@ -843,6 +885,9 @@ void writeAggregateReport(const std::filesystem::path& path, const DatasetAnalys
     output << ", \"live\": ";
     writeStringCounts(liveFormats);
     output << "},\n"
+           << "    \"roi_boundary_normalization\": {\"cases\": "
+           << allCases.roi_boundary_normalized_cases << ", \"lines\": "
+           << allCases.roi_boundary_normalized_lines << "},\n"
            << "    \"alignment_evidence\": {\"homography_available_cases\": "
            << allCases.homography_available_cases << ", \"ecc_converged_cases\": "
            << allCases.ecc_converged_cases << ", \"valid_overlap_available_cases\": "
@@ -885,7 +930,8 @@ CaseRecord analyzeCase(const std::filesystem::path& datasetRoot, const std::file
         return record;
     }
 
-    const std::vector<Roi> rois = readRois(roiPath, record.errors);
+    const std::vector<Roi> rois = readRois(roiPath, record.errors, record.warnings);
+    record.roi_boundary_normalized_lines = record.warnings.size();
     std::set<std::string> categories;
     for (const Roi& roi : rois) {
         categories.insert(roi.category);

@@ -104,6 +104,12 @@ void writeInvalidCase(const std::filesystem::path& root) {
     roi << "17 0.9 0.5 0.4 0.5\n";
 }
 
+void writeToleratedRoiCase(const std::filesystem::path& root) {
+    const cv::Mat standard = createStandardImage();
+    writeValidCase(root, "station_component_boundary_tolerated", standard, standard,
+                   "17 0.776495 0.623402 0.447011 0.430379\n");
+}
+
 std::string readFile(const std::filesystem::path& path) {
     std::ifstream input(path);
     return {std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
@@ -122,6 +128,7 @@ int main() {
     writeVariationCases(fixtureRoot);
     writeIncompleteCase(fixtureRoot);
     writeInvalidCase(fixtureRoot);
+    writeToleratedRoiCase(fixtureRoot);
 
     // The public data-characterization operation observes the controlled
     // variation suite, validates incomplete input, and never exports images.
@@ -131,7 +138,7 @@ int main() {
     request.output_directory = outputRoot;
     const auto result = service.analyzeDataset(request);
 
-    if (result.summary.total_cases != 10 || result.summary.valid_cases != 8 ||
+    if (result.summary.total_cases != 11 || result.summary.valid_cases != 9 ||
         result.summary.incomplete_cases != 1 || result.summary.invalid_cases != 1 ||
         !fs::is_regular_file(result.report_path) ||
         !fs::is_regular_file(result.case_report_path) || !fs::is_regular_file(result.group_report_path)) {
@@ -146,9 +153,11 @@ int main() {
         report.find("\"valid_overlap_ratio\"") == std::string::npos ||
         report.find("\"value\": \"UNCLASSIFIED\"") == std::string::npos ||
         report.find("\"value\": \"18\"") == std::string::npos ||
+        report.find("\"roi_boundary_normalization\": {\"cases\": 1, \"lines\": 1}") == std::string::npos ||
         report.find("\"mean_roi_relative_area\": {\"count\": 1, \"min\": 0.04") == std::string::npos ||
         cases.find("missing standard image") == std::string::npos ||
         cases.find("invalid ROI at line 1") == std::string::npos ||
+        cases.find("ROI boundary normalized at line 1") == std::string::npos ||
         cases.find("station_component_rotation") == std::string::npos ||
         cases.find("station_component_scale") == std::string::npos ||
         cases.find("station_component_perspective") == std::string::npos ||
