@@ -1,0 +1,4 @@
+C:/Users/47326/Desktop/异动检测/build-onnx/CMakeFiles/lximagecmp.dir
+C:/Users/47326/Desktop/异动检测/build-onnx/CMakeFiles/imagecmp_test.dir
+C:/Users/47326/Desktop/异动检测/build-onnx/CMakeFiles/ALL_BUILD.dir
+C:/Users/47326/Desktop/异动检测/build-onnx/CMakeFiles/ZERO_CHECK.dir

@@ -1,0 +1,28 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="17.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <ClCompile Include="C:\Users\47326\Desktop\异动检测\imagecmp_v2\yidong_main_onnx.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="C:\Users\47326\Desktop\异动检测\imagecmp_v2\onnx_runtime\onnx_pipeline.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="C:\Users\47326\Desktop\异动检测\imagecmp_v2\imagecmp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="C:\Users\47326\Desktop\异动检测\imagecmp_v2\base64.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="C:\Users\47326\Desktop\异动检测\imagecmp_v2\Laplacian.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <CustomBuild Include="C:\Users\47326\Desktop\异动检测\imagecmp_v2\CMakeLists.txt" />
+  </ItemGroup>
+  <ItemGroup>
+    <Filter Include="Source Files">
+      <UniqueIdentifier>{AFBD47AD-7A8F-31D3-88E0-4D91C4EFC273}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+</Project>
