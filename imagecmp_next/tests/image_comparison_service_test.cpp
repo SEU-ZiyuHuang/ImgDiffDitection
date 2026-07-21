@@ -4,10 +4,12 @@
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
 
+#include <cmath>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -110,9 +112,67 @@ void writeToleratedRoiCase(const std::filesystem::path& root) {
                    "17 0.776495 0.623402 0.447011 0.430379\n");
 }
 
+void writeAlignmentUnavailableCase(const std::filesystem::path& root) {
+    const cv::Mat featureless(80, 80, CV_8UC3, cv::Scalar(100, 100, 100));
+    writeValidCase(root, "station_component_alignment_unavailable", featureless, featureless);
+}
+
 std::string readFile(const std::filesystem::path& path) {
     std::ifstream input(path);
     return {std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
+}
+
+std::vector<std::string> parseCsvLine(const std::string& line) {
+    std::vector<std::string> fields;
+    std::string field;
+    bool quoted = false;
+    for (std::size_t index = 0; index < line.size(); ++index) {
+        const char character = line[index];
+        if (character == '"') {
+            if (quoted && index + 1 < line.size() && line[index + 1] == '"') {
+                field.push_back(character);
+                ++index;
+            } else {
+                quoted = !quoted;
+            }
+        } else if (character == ',' && !quoted) {
+            fields.push_back(field);
+            field.clear();
+        } else {
+            field.push_back(character);
+        }
+    }
+    fields.push_back(field);
+    return fields;
+}
+
+std::string csvValueForCase(const std::string& csv, const std::string& caseName, const std::string& columnName) {
+    std::istringstream input(csv);
+    std::string line;
+    if (!std::getline(input, line)) {
+        throw std::runtime_error("CSV has no header");
+    }
+    const std::vector<std::string> headers = parseCsvLine(line);
+    std::size_t columnIndex = headers.size();
+    for (std::size_t index = 0; index < headers.size(); ++index) {
+        if (headers[index] == columnName) {
+            columnIndex = index;
+            break;
+        }
+    }
+    if (columnIndex == headers.size()) {
+        throw std::runtime_error("CSV column not found: " + columnName);
+    }
+    while (std::getline(input, line)) {
+        const std::vector<std::string> values = parseCsvLine(line);
+        if (!values.empty() && values[0] == caseName) {
+            if (values.size() != headers.size()) {
+                throw std::runtime_error("CSV row has unexpected column count");
+            }
+            return values[columnIndex];
+        }
+    }
+    throw std::runtime_error("CSV case not found: " + caseName);
 }
 
 }  // namespace
@@ -129,6 +189,7 @@ int main() {
     writeIncompleteCase(fixtureRoot);
     writeInvalidCase(fixtureRoot);
     writeToleratedRoiCase(fixtureRoot);
+    writeAlignmentUnavailableCase(fixtureRoot);
 
     // The public data-characterization operation observes the controlled
     // variation suite, validates incomplete input, and never exports images.
@@ -138,7 +199,7 @@ int main() {
     request.output_directory = outputRoot;
     const auto result = service.analyzeDataset(request);
 
-    if (result.summary.total_cases != 11 || result.summary.valid_cases != 9 ||
+    if (result.summary.total_cases != 12 || result.summary.valid_cases != 10 ||
         result.summary.incomplete_cases != 1 || result.summary.invalid_cases != 1 ||
         !fs::is_regular_file(result.report_path) ||
         !fs::is_regular_file(result.case_report_path) || !fs::is_regular_file(result.group_report_path)) {
@@ -150,6 +211,8 @@ int main() {
     const std::string cases = readFile(result.case_report_path);
     if (report.find("\"component_category\"") == std::string::npos ||
         report.find("\"case_type\"") == std::string::npos ||
+        report.find("\"schema_version\": \"p1-characterization-v2\"") == std::string::npos ||
+        report.find("\"alignment_diagnostic_policy\"") == std::string::npos ||
         report.find("\"valid_overlap_ratio\"") == std::string::npos ||
         report.find("\"value\": \"UNCLASSIFIED\"") == std::string::npos ||
         report.find("\"value\": \"18\"") == std::string::npos ||
@@ -166,6 +229,29 @@ int main() {
         cases.find("station_component_blur") == std::string::npos ||
         cases.find("station_component_local_change") == std::string::npos) {
         std::cerr << "Expected local reports to preserve grouping, alignment evidence, and errors.\n";
+        return EXIT_FAILURE;
+    }
+
+    try {
+        const double centerDisplacement = std::stod(csvValueForCase(
+            cases, "station_component_translation", "center_displacement_pixels"));
+        const double relativeCenterDisplacement = std::stod(csvValueForCase(
+            cases, "station_component_translation", "center_displacement_relative_diagonal"));
+        const std::string alignmentDiagnostic =
+            csvValueForCase(cases, "station_component_translation", "alignment_diagnostic");
+        const std::string unavailableDiagnostic =
+            csvValueForCase(cases, "station_component_alignment_unavailable", "alignment_diagnostic");
+        const std::string unavailableReasons =
+            csvValueForCase(cases, "station_component_alignment_unavailable", "alignment_diagnostic_reasons");
+        if (centerDisplacement > 10.0 || relativeCenterDisplacement > 0.03 || alignmentDiagnostic != "usable" ||
+            unavailableDiagnostic != "unavailable" || unavailableReasons.find("homography unavailable") == std::string::npos ||
+            cases.find("translation_pixels") != std::string::npos || cases.find("scale_estimate") != std::string::npos ||
+            cases.find("rotation_degrees") != std::string::npos) {
+            std::cerr << "Expected projected displacement metrics and a usable diagnostic for a small translation.\n";
+            return EXIT_FAILURE;
+        }
+    } catch (const std::exception& error) {
+        std::cerr << "Cannot validate projected alignment metrics: " << error.what() << '\n';
         return EXIT_FAILURE;
     }
 

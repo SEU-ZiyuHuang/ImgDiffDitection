@@ -27,3 +27,5 @@ The caller-selected output directory receives only local reports:
 - `p1_groups.csv`: compact component-category and case-type aggregate view.
 
 Component-category grouping uses the YOLO class ID. Cases without a parseable ROI are retained in the `UNCLASSIFIED` category so missing/invalid input remains visible in failure statistics. The report records raw, unaligned luma variation separately from alignment evidence. ORB feature matching, RANSAC homography, and ECC are measured to choose a future P1 alignment strategy; they do not make a normal/anomalous conclusion and are not production thresholds.
+
+See [P1_DATA_PROCESSING.md](P1_DATA_PROCESSING.md) for the exact processing flow, formulas, report fields, and the non-production alignment diagnostic rules used by the current implementation.

@@ -27,6 +27,17 @@ namespace {
 
 constexpr double kNotAvailable = std::numeric_limits<double>::quiet_NaN();
 constexpr double kRoiBoundaryTolerance = 0.01;
+// These guards classify the observed alignment evidence for P-1 reporting only.
+// They are deliberately not a production decision policy.
+constexpr int kMinimumDiagnosticFeatureMatches = 12;
+constexpr int kMinimumDiagnosticInliers = 8;
+constexpr double kMinimumDiagnosticInlierRate = 0.40;
+constexpr double kMaximumDiagnosticReprojectionErrorPixels = 3.0;
+constexpr double kMinimumDiagnosticSpatialCoverage = 0.02;
+constexpr double kMinimumDiagnosticProjectedAreaRatio = 0.20;
+constexpr double kMaximumDiagnosticProjectedAreaRatio = 5.0;
+constexpr double kMinimumDiagnosticOverlapRatio = 0.60;
+constexpr double kMinimumDiagnosticEccCorrelationWhenConverged = 0.20;
 
 struct Roi {
     std::string category;
@@ -48,6 +59,7 @@ struct RoiTotals {
 };
 
 enum class CaseStatus { kValid, kIncomplete, kInvalid };
+enum class AlignmentDiagnostic { kUnavailable, kUnreliable, kUsable };
 
 struct CaseRecord {
     std::string relative_case_path;
@@ -91,14 +103,19 @@ struct CaseRecord {
     double inlier_rate = kNotAvailable;
     double reprojection_error_pixels = kNotAvailable;
     double spatial_coverage = kNotAvailable;
-    double translation_pixels = kNotAvailable;
-    double scale_estimate = kNotAvailable;
-    double rotation_degrees = kNotAvailable;
+    double center_displacement_pixels = kNotAvailable;
+    double center_displacement_relative_diagonal = kNotAvailable;
+    double corner_displacement_median_pixels = kNotAvailable;
+    int projected_corners_in_live_frame = 0;
+    double projected_area_ratio = kNotAvailable;
+    bool projected_geometry_valid = false;
     bool homography_available = false;
     bool ecc_converged = false;
     double ecc_correlation = kNotAvailable;
     bool valid_overlap_available = false;
     double valid_overlap_ratio = kNotAvailable;
+    AlignmentDiagnostic alignment_diagnostic = AlignmentDiagnostic::kUnavailable;
+    std::vector<std::string> alignment_diagnostic_reasons;
 };
 
 using MetricSamples = std::map<std::string, std::vector<double>>;
@@ -113,6 +130,9 @@ struct GroupAccumulator {
     std::size_t homography_available_cases = 0;
     std::size_t ecc_converged_cases = 0;
     std::size_t valid_overlap_available_cases = 0;
+    std::size_t alignment_unavailable_cases = 0;
+    std::size_t alignment_unreliable_cases = 0;
+    std::size_t alignment_usable_cases = 0;
     MetricSamples metrics;
 };
 
@@ -279,6 +299,150 @@ void addError(CaseRecord& record, const std::string& error) {
     record.errors.push_back(error);
 }
 
+bool isFiniteHomography(const cv::Mat& homography) {
+    if (homography.rows != 3 || homography.cols != 3 || homography.type() != CV_64F) {
+        return false;
+    }
+    for (int row = 0; row < homography.rows; ++row) {
+        for (int column = 0; column < homography.cols; ++column) {
+            if (!std::isfinite(homography.at<double>(row, column))) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+bool isFinitePoint(const cv::Point2f& point) {
+    return std::isfinite(point.x) && std::isfinite(point.y);
+}
+
+bool isPointInImage(const cv::Point2f& point, const cv::Mat& image) {
+    return point.x >= 0.0F && point.x <= static_cast<float>(image.cols - 1) && point.y >= 0.0F &&
+           point.y <= static_cast<float>(image.rows - 1);
+}
+
+double medianOf(std::vector<double> values) {
+    if (values.empty()) {
+        return kNotAvailable;
+    }
+    std::sort(values.begin(), values.end());
+    const std::size_t middle = values.size() / 2;
+    if (values.size() % 2 != 0) {
+        return values[middle];
+    }
+    return (values[middle - 1] + values[middle]) / 2.0;
+}
+
+void addAlignmentDiagnosticReason(CaseRecord& record, const std::string& reason) {
+    if (std::find(record.alignment_diagnostic_reasons.begin(), record.alignment_diagnostic_reasons.end(), reason) ==
+        record.alignment_diagnostic_reasons.end()) {
+        record.alignment_diagnostic_reasons.push_back(reason);
+    }
+}
+
+void addProjectedGeometryMetrics(const cv::Mat& homography, const cv::Mat& standardGray, const cv::Mat& liveGray,
+                                 CaseRecord& record) {
+    if (!isFiniteHomography(homography)) {
+        addAlignmentDiagnosticReason(record, "homography contains a non-finite coefficient");
+        return;
+    }
+
+    const std::vector<cv::Point2f> standardCorners = {
+        {0.0F, 0.0F}, {static_cast<float>(standardGray.cols - 1), 0.0F},
+        {static_cast<float>(standardGray.cols - 1), static_cast<float>(standardGray.rows - 1)},
+        {0.0F, static_cast<float>(standardGray.rows - 1)}};
+    std::vector<cv::Point2f> referencePoints = standardCorners;
+    referencePoints.emplace_back(static_cast<float>(standardGray.cols - 1) / 2.0F,
+                                 static_cast<float>(standardGray.rows - 1) / 2.0F);
+    std::vector<cv::Point2f> projectedPoints;
+    cv::perspectiveTransform(referencePoints, projectedPoints, homography);
+    if (projectedPoints.size() != referencePoints.size() ||
+        !std::all_of(projectedPoints.begin(), projectedPoints.end(), isFinitePoint)) {
+        addAlignmentDiagnosticReason(record, "projected image geometry is non-finite");
+        return;
+    }
+
+    const std::vector<cv::Point2f> projectedCorners(projectedPoints.begin(), projectedPoints.begin() + 4);
+    const double projectedArea = std::abs(cv::contourArea(projectedCorners));
+    if (!std::isfinite(projectedArea) || projectedArea <= 1.0 || !cv::isContourConvex(projectedCorners)) {
+        addAlignmentDiagnosticReason(record, "projected image geometry is degenerate");
+        return;
+    }
+
+    record.projected_geometry_valid = true;
+    record.projected_area_ratio = projectedArea / static_cast<double>(liveGray.cols * liveGray.rows);
+    const cv::Point2f liveCenter(static_cast<float>(liveGray.cols - 1) / 2.0F,
+                                 static_cast<float>(liveGray.rows - 1) / 2.0F);
+    record.center_displacement_pixels = cv::norm(projectedPoints.back() - liveCenter);
+    record.center_displacement_relative_diagonal =
+        record.center_displacement_pixels / std::hypot(static_cast<double>(liveGray.cols), static_cast<double>(liveGray.rows));
+
+    const std::vector<cv::Point2f> liveCorners = {
+        {0.0F, 0.0F}, {static_cast<float>(liveGray.cols - 1), 0.0F},
+        {static_cast<float>(liveGray.cols - 1), static_cast<float>(liveGray.rows - 1)},
+        {0.0F, static_cast<float>(liveGray.rows - 1)}};
+    std::vector<double> cornerDisplacements;
+    cornerDisplacements.reserve(projectedCorners.size());
+    for (std::size_t index = 0; index < projectedCorners.size(); ++index) {
+        cornerDisplacements.push_back(cv::norm(projectedCorners[index] - liveCorners[index]));
+        if (isPointInImage(projectedCorners[index], liveGray)) {
+            ++record.projected_corners_in_live_frame;
+        }
+    }
+    record.corner_displacement_median_pixels = medianOf(std::move(cornerDisplacements));
+}
+
+void finalizeAlignmentDiagnostic(CaseRecord& record) {
+    if (!record.homography_available) {
+        addAlignmentDiagnosticReason(record, "homography unavailable");
+        record.alignment_diagnostic = AlignmentDiagnostic::kUnavailable;
+        return;
+    }
+    if (!record.projected_geometry_valid) {
+        addAlignmentDiagnosticReason(record, "projected geometry unavailable");
+        record.alignment_diagnostic = AlignmentDiagnostic::kUnavailable;
+        return;
+    }
+    if (!record.valid_overlap_available) {
+        addAlignmentDiagnosticReason(record, "valid overlap unavailable");
+        record.alignment_diagnostic = AlignmentDiagnostic::kUnavailable;
+        return;
+    }
+
+    if (record.feature_match_count < kMinimumDiagnosticFeatureMatches) {
+        addAlignmentDiagnosticReason(record, "feature matches below diagnostic minimum (12)");
+    }
+    if (record.inlier_count < kMinimumDiagnosticInliers) {
+        addAlignmentDiagnosticReason(record, "inliers below diagnostic minimum (8)");
+    }
+    if (!std::isfinite(record.inlier_rate) || record.inlier_rate < kMinimumDiagnosticInlierRate) {
+        addAlignmentDiagnosticReason(record, "inlier rate below diagnostic minimum (0.40)");
+    }
+    if (!std::isfinite(record.reprojection_error_pixels) ||
+        record.reprojection_error_pixels > kMaximumDiagnosticReprojectionErrorPixels) {
+        addAlignmentDiagnosticReason(record, "reprojection error exceeds diagnostic maximum (3 px)");
+    }
+    if (!std::isfinite(record.spatial_coverage) || record.spatial_coverage < kMinimumDiagnosticSpatialCoverage) {
+        addAlignmentDiagnosticReason(record, "inlier spatial coverage below diagnostic minimum (0.02)");
+    }
+    if (!std::isfinite(record.projected_area_ratio) ||
+        record.projected_area_ratio < kMinimumDiagnosticProjectedAreaRatio ||
+        record.projected_area_ratio > kMaximumDiagnosticProjectedAreaRatio) {
+        addAlignmentDiagnosticReason(record, "projected area ratio outside diagnostic range [0.20, 5.00]");
+    }
+    if (!std::isfinite(record.valid_overlap_ratio) || record.valid_overlap_ratio < kMinimumDiagnosticOverlapRatio) {
+        addAlignmentDiagnosticReason(record, "valid overlap below diagnostic minimum (0.60)");
+    }
+    if (record.ecc_converged && record.ecc_correlation < kMinimumDiagnosticEccCorrelationWhenConverged) {
+        addAlignmentDiagnosticReason(record, "ECC correlation below diagnostic minimum after convergence (0.20)");
+    }
+
+    record.alignment_diagnostic = record.alignment_diagnostic_reasons.empty()
+                                      ? AlignmentDiagnostic::kUsable
+                                      : AlignmentDiagnostic::kUnreliable;
+}
+
 void analyzeFeatureAndAlignmentEvidence(const cv::Mat& standardGray, const cv::Mat& liveGray,
                                         CaseRecord& record) {
     const cv::Ptr<cv::ORB> orb = cv::ORB::create(2000);
@@ -355,16 +519,14 @@ void analyzeFeatureAndAlignmentEvidence(const cv::Mat& standardGray, const cv::M
                                   static_cast<double>(standardGray.cols * standardGray.rows);
     }
 
-    const double h00 = homography.at<double>(0, 0);
-    const double h01 = homography.at<double>(0, 1);
-    const double h10 = homography.at<double>(1, 0);
-    const double h11 = homography.at<double>(1, 1);
-    record.translation_pixels = std::hypot(homography.at<double>(0, 2), homography.at<double>(1, 2));
-    record.scale_estimate = std::sqrt(std::abs(h00 * h11 - h01 * h10));
-    record.rotation_degrees = std::atan2(h10, h00) * 180.0 / CV_PI;
+    addProjectedGeometryMetrics(homography, standardGray, liveGray, record);
+    if (!record.projected_geometry_valid) {
+        return;
+    }
 
     cv::Mat inverseHomography;
     if (cv::invert(homography, inverseHomography, cv::DECOMP_SVD) == 0.0) {
+        addAlignmentDiagnosticReason(record, "homography cannot be inverted");
         return;
     }
 
@@ -455,6 +617,7 @@ void analyzeImages(const std::filesystem::path& standardPath, const std::filesys
     record.image_analysis_complete = true;
 
     analyzeFeatureAndAlignmentEvidence(standardGray, liveGray, record);
+    finalizeAlignmentDiagnostic(record);
 }
 
 void addMetric(MetricSamples& samples, const std::string& name, double value) {
@@ -495,24 +658,39 @@ MetricSamples metricsFor(const CaseRecord& record) {
     addMetric(metrics, "inlier_rate", record.inlier_rate);
     addMetric(metrics, "reprojection_error_pixels", record.reprojection_error_pixels);
     addMetric(metrics, "spatial_coverage", record.spatial_coverage);
-    addMetric(metrics, "translation_pixels", record.translation_pixels);
-    addMetric(metrics, "scale_estimate", record.scale_estimate);
-    addMetric(metrics, "rotation_degrees", record.rotation_degrees);
+    addMetric(metrics, "center_displacement_pixels", record.center_displacement_pixels);
+    addMetric(metrics, "center_displacement_relative_diagonal", record.center_displacement_relative_diagonal);
+    addMetric(metrics, "corner_displacement_median_pixels", record.corner_displacement_median_pixels);
+    addMetric(metrics, "projected_corners_in_live_frame", record.projected_corners_in_live_frame);
+    addMetric(metrics, "projected_area_ratio", record.projected_area_ratio);
     addMetric(metrics, "ecc_correlation", record.ecc_correlation);
     addMetric(metrics, "valid_overlap_ratio", record.valid_overlap_ratio);
     return metrics;
 }
 
-const std::array<const char*, 32>& metricNames() {
-    static const std::array<const char*, 32> names = {
+const std::array<const char*, 34>& metricNames() {
+    static const std::array<const char*, 34> names = {
         "standard_width", "standard_height", "live_width", "live_height", "standard_channels", "live_channels",
         "roi_count", "standard_brightness", "live_brightness", "standard_contrast", "live_contrast",
         "standard_sharpness", "live_sharpness", "brightness_delta", "contrast_delta", "sharpness_delta",
         "raw_luma_mad", "aspect_ratio_delta", "mean_roi_relative_area", "mean_roi_aspect_ratio",
         "standard_keypoints", "live_keypoints", "feature_match_count", "inlier_count", "inlier_rate",
-        "reprojection_error_pixels", "spatial_coverage", "translation_pixels", "scale_estimate", "rotation_degrees",
-        "ecc_correlation", "valid_overlap_ratio"};
+        "reprojection_error_pixels", "spatial_coverage", "center_displacement_pixels",
+        "center_displacement_relative_diagonal", "corner_displacement_median_pixels",
+        "projected_corners_in_live_frame", "projected_area_ratio", "ecc_correlation", "valid_overlap_ratio"};
     return names;
+}
+
+std::string alignmentDiagnosticName(AlignmentDiagnostic diagnostic) {
+    switch (diagnostic) {
+        case AlignmentDiagnostic::kUnavailable:
+            return "unavailable";
+        case AlignmentDiagnostic::kUnreliable:
+            return "unreliable";
+        case AlignmentDiagnostic::kUsable:
+            return "usable";
+    }
+    return "unavailable";
 }
 
 void addRecord(GroupAccumulator& group, const CaseRecord& record) {
@@ -532,6 +710,17 @@ void addRecord(GroupAccumulator& group, const CaseRecord& record) {
     }
     if (record.valid_overlap_available) {
         ++group.valid_overlap_available_cases;
+    }
+    switch (record.alignment_diagnostic) {
+        case AlignmentDiagnostic::kUnavailable:
+            ++group.alignment_unavailable_cases;
+            break;
+        case AlignmentDiagnostic::kUnreliable:
+            ++group.alignment_unreliable_cases;
+            break;
+        case AlignmentDiagnostic::kUsable:
+            ++group.alignment_usable_cases;
+            break;
     }
     if (record.roi_boundary_normalized_lines != 0) {
         ++group.roi_boundary_normalized_cases;
@@ -675,7 +864,11 @@ void writeGroup(std::ostream& output, const std::string& value, const GroupAccum
            << "  \"alignment_evidence\": {\"homography_available_cases\": "
            << group.homography_available_cases << ", \"ecc_converged_cases\": "
            << group.ecc_converged_cases << ", \"valid_overlap_available_cases\": "
-           << group.valid_overlap_available_cases << "},\n" << indent << "  \"metrics\": ";
+           << group.valid_overlap_available_cases << "},\n" << indent
+           << "  \"alignment_diagnostic\": {\"unavailable_cases\": "
+           << group.alignment_unavailable_cases << ", \"unreliable_cases\": "
+           << group.alignment_unreliable_cases << ", \"usable_cases\": " << group.alignment_usable_cases
+           << "},\n" << indent << "  \"metrics\": ";
     writeMetricDistributions(output, group.metrics, indent + "  ");
     output << "\n" << indent << '}';
 }
@@ -747,7 +940,9 @@ void writeCaseReport(const std::filesystem::path& path, const std::vector<CaseRe
               "brightness_delta,contrast_delta,sharpness_delta,raw_luma_mad,aspect_ratio_delta,mean_roi_relative_area,"
               "mean_roi_aspect_ratio,standard_keypoints,"
               "live_keypoints,feature_match_count,inlier_count,inlier_rate,reprojection_error_pixels,spatial_coverage,"
-              "translation_pixels,scale_estimate,rotation_degrees,homography_available,ecc_converged,ecc_correlation,"
+              "center_displacement_pixels,center_displacement_relative_diagonal,corner_displacement_median_pixels,"
+              "projected_corners_in_live_frame,projected_area_ratio,projected_geometry_valid,alignment_diagnostic,"
+              "alignment_diagnostic_reasons,homography_available,ecc_converged,ecc_correlation,"
               "valid_overlap_available,valid_overlap_ratio\n";
     for (const CaseRecord& record : cases) {
         writeCsvValue(output, record.relative_case_path);
@@ -768,20 +963,26 @@ void writeCaseReport(const std::filesystem::path& path, const std::vector<CaseRe
         output << ',' << record.standard_width << ',' << record.standard_height << ',' << record.standard_channels
                << ',' << record.live_width << ',' << record.live_height << ',' << record.live_channels << ','
                << record.roi_count << ',';
-        const std::array<double, 23> values = {
+        const std::array<double, 25> values = {
             record.standard_brightness, record.live_brightness, record.standard_contrast, record.live_contrast,
             record.standard_sharpness, record.live_sharpness, record.brightness_delta, record.contrast_delta,
             record.sharpness_delta, record.raw_luma_mad, record.aspect_ratio_delta, record.mean_roi_relative_area,
             record.mean_roi_aspect_ratio,
             static_cast<double>(record.standard_keypoints), static_cast<double>(record.live_keypoints),
             static_cast<double>(record.feature_match_count), static_cast<double>(record.inlier_count),
-            record.inlier_rate, record.reprojection_error_pixels, record.spatial_coverage, record.translation_pixels,
-            record.scale_estimate, record.rotation_degrees};
+            record.inlier_rate, record.reprojection_error_pixels, record.spatial_coverage,
+            record.center_displacement_pixels, record.center_displacement_relative_diagonal,
+            record.corner_displacement_median_pixels, static_cast<double>(record.projected_corners_in_live_frame),
+            record.projected_area_ratio};
         for (double value : values) {
             writeCsvNumber(output, value);
             output << ',';
         }
-        output << (record.homography_available ? "true" : "false") << ','
+        output << (record.projected_geometry_valid ? "true" : "false") << ',';
+        writeCsvValue(output, alignmentDiagnosticName(record.alignment_diagnostic));
+        output << ',';
+        writeCsvValue(output, join(record.alignment_diagnostic_reasons, "; "));
+        output << ',' << (record.homography_available ? "true" : "false") << ','
                << (record.ecc_converged ? "true" : "false") << ',';
         writeCsvNumber(output, record.ecc_correlation);
         output << ',' << (record.valid_overlap_available ? "true" : "false") << ',';
@@ -805,8 +1006,10 @@ void writeGroupReport(const std::filesystem::path& path,
     output << "group_dimension,group_value,case_count,valid_cases,incomplete_cases,invalid_cases,"
               "roi_boundary_normalized_cases,roi_boundary_normalized_lines,"
               "homography_available_cases,ecc_converged_cases,valid_overlap_available_cases,"
+              "alignment_unavailable_cases,alignment_unreliable_cases,alignment_usable_cases,"
               "mean_raw_luma_mad,mean_feature_match_count,mean_inlier_rate,mean_reprojection_error_pixels,"
-              "mean_spatial_coverage,mean_ecc_correlation,mean_valid_overlap_ratio\n";
+              "mean_spatial_coverage,mean_center_displacement_relative_diagonal,mean_projected_area_ratio,"
+              "mean_ecc_correlation,mean_valid_overlap_ratio\n";
     const auto writeDimension = [&output](const std::string& dimension,
                                           const std::map<std::string, GroupAccumulator>& groups) {
         for (const auto& entry : groups) {
@@ -817,11 +1020,15 @@ void writeGroupReport(const std::filesystem::path& path,
             output << ',' << group.case_count << ',' << group.valid_cases << ',' << group.incomplete_cases << ','
                    << group.invalid_cases << ',' << group.roi_boundary_normalized_cases << ','
                    << group.roi_boundary_normalized_lines << ',' << group.homography_available_cases << ','
-                   << group.ecc_converged_cases << ',' << group.valid_overlap_available_cases << ',';
-            const std::array<double, 7> means = {
+                   << group.ecc_converged_cases << ',' << group.valid_overlap_available_cases << ','
+                   << group.alignment_unavailable_cases << ',' << group.alignment_unreliable_cases << ','
+                   << group.alignment_usable_cases << ',';
+            const std::array<double, 9> means = {
                 distributionMean(group, "raw_luma_mad"), distributionMean(group, "feature_match_count"),
                 distributionMean(group, "inlier_rate"), distributionMean(group, "reprojection_error_pixels"),
-                distributionMean(group, "spatial_coverage"), distributionMean(group, "ecc_correlation"),
+                distributionMean(group, "spatial_coverage"),
+                distributionMean(group, "center_displacement_relative_diagonal"),
+                distributionMean(group, "projected_area_ratio"), distributionMean(group, "ecc_correlation"),
                 distributionMean(group, "valid_overlap_ratio")};
             for (std::size_t index = 0; index < means.size(); ++index) {
                 writeCsvNumber(output, means[index]);
@@ -861,7 +1068,7 @@ void writeAggregateReport(const std::filesystem::path& path, const DatasetAnalys
     };
 
     output << "{\n"
-           << "  \"schema_version\": \"p1-characterization-v1\",\n"
+           << "  \"schema_version\": \"p1-characterization-v2\",\n"
            << "  \"scope\": {\n"
            << "    \"execution\": \"local-only\",\n"
            << "    \"network_operations\": \"none\",\n"
@@ -871,8 +1078,22 @@ void writeAggregateReport(const std::filesystem::path& path, const DatasetAnalys
            << "  \"limitations\": [\n"
            << "    \"This is a descriptive P-1 dataset characterization report, not a detection result.\",\n"
            << "    \"It makes no anomaly recall, missed-detection, precision, or production-readiness claim.\",\n"
-           << "    \"ORB ratio matching, RANSAC homography, and ECC are observed for alignment selection only; their values are not production decision thresholds.\"\n"
+           << "    \"ORB ratio matching, RANSAC homography, and ECC are observed for alignment selection only; their values are not production decision thresholds.\",\n"
+           << "    \"The alignment diagnostic is a fixed P-1 reporting triage, not a deployment policy; it requires review against labelled change data before production use.\"\n"
            << "  ],\n"
+           << "  \"alignment_diagnostic_policy\": {\n"
+           << "    \"purpose\": \"P-1 descriptive triage of homography evidence; not a production decision policy\",\n"
+           << "    \"usable_requires\": {\"feature_match_count_min\": "
+           << kMinimumDiagnosticFeatureMatches << ", \"inlier_count_min\": " << kMinimumDiagnosticInliers
+           << ", \"inlier_rate_min\": " << kMinimumDiagnosticInlierRate
+           << ", \"reprojection_error_pixels_max\": " << kMaximumDiagnosticReprojectionErrorPixels
+           << ", \"spatial_coverage_min\": " << kMinimumDiagnosticSpatialCoverage
+           << ", \"projected_area_ratio_min\": " << kMinimumDiagnosticProjectedAreaRatio
+           << ", \"projected_area_ratio_max\": " << kMaximumDiagnosticProjectedAreaRatio
+           << ", \"valid_overlap_ratio_min\": " << kMinimumDiagnosticOverlapRatio << "},\n"
+           << "    \"ecc_rule\": \"ECC is optional; if it converges, correlation must be at least "
+           << kMinimumDiagnosticEccCorrelationWhenConverged << " for the usable diagnostic class\"\n"
+           << "  },\n"
            << "  \"summary\": {\n"
            << "    \"total_cases\": " << summary.total_cases << ",\n"
            << "    \"valid_cases\": " << summary.valid_cases << ",\n"
@@ -892,6 +1113,10 @@ void writeAggregateReport(const std::filesystem::path& path, const DatasetAnalys
            << allCases.homography_available_cases << ", \"ecc_converged_cases\": "
            << allCases.ecc_converged_cases << ", \"valid_overlap_available_cases\": "
            << allCases.valid_overlap_available_cases << "},\n"
+           << "    \"alignment_diagnostic\": {\"unavailable_cases\": "
+           << allCases.alignment_unavailable_cases << ", \"unreliable_cases\": "
+           << allCases.alignment_unreliable_cases << ", \"usable_cases\": "
+           << allCases.alignment_usable_cases << "},\n"
            << "    \"metrics\": ";
     writeMetricDistributions(output, allCases.metrics, "    ");
     output << "\n  },\n"
