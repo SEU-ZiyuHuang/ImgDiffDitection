@@ -5,6 +5,7 @@
 /third_party/opencv-4.12.0/opencv/build/x64/vc16/bin/opencv_world4120d.pdb
 /third_party/opencv-4.12.0-windows.exe
 /build-onnx/bin/Release/opencv_world4120d.dll
+/imagecmp_next/build/
 /third_party/opencv-4.12.0/opencv/build/x64/vc16/bin/opencv_world4120d.dll
 
 # Do not publish certificate key material from third-party samples.
