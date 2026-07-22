@@ -89,6 +89,20 @@ python .\imagecmp_py\cli.py calibrate-case `
 
 日常检测额外写入 `daily_result.json`，其中包含整图结论、参考图选择、全部部件结论、证据路径和配置版本。标定模式写入 `calibration_observation.json`，其中只包含观察结果和证据路径。
 
+## 可信对齐与部件映射闸门
+
+差异检测之前，系统必须为每个预期部件保留并通过以下证据链：
+
+1. 特征匹配、RANSAC 内点、重投影误差与空间覆盖度建立标准图到实时图的几何变换；
+2. ECC 局部精调必须收敛；近似恒等变换、低空间覆盖度和 ECC 未收敛会被识别为远近景/父子视图疑似，输出 `detection_unavailable` / `match_uncertain`；
+3. 预期部件框投影到实时图后，候选区域必须在画面内且具有足够的有效重叠；
+4. 在 `valid_mask ∩ ROI` 上记录 NCC 与 SSIM 外观一致性。整体外观不一致不会进入差异检测；
+5. 通过单应变换估计实时部件的原生有效分辨率。比较会降至两图的较低共同分辨率；若低于配置下限，输出 `detection_unavailable`，不会以放大图做细微异动结论。
+
+这些指标均位于 `alignment_metrics`，包括 `alignment_stages`、`component_mapping_stages`、ECC 状态、候选区域有效比例、NCC/SSIM 和有效分辨率。`alignment.png` 还会显示抽样的 RANSAC 内点连线，便于人工复核匹配证据。
+
+相关门槛是完整标定配置中的 `alignment` 字段，开发默认值只用于本地观察和合成测试；正式日常检测仍必须由后续标定给出版本化配置。
+
 ## 当前边界
 
 - 开发配置不是正式标定配置，不能用于现场生产判断。

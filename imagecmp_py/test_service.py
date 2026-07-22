@@ -22,6 +22,7 @@ import tempfile
 from dataclasses import asdict
 from pathlib import Path
 from typing import Optional
+from unittest.mock import patch
 
 import cv2
 import numpy as np
@@ -521,6 +522,173 @@ def test_unreliable_alignment_is_unavailable_with_artifacts():
         ))
 
 
+def test_ecc_non_convergence_is_negative_alignment_evidence():
+    """A failed local refinement cannot silently enter difference detection."""
+    service = ImageComparisonService()
+    image = _create_textured_image()
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        standard_path = tmp_path / "standard.png"
+        live_path = tmp_path / "live.png"
+        _write_image(standard_path, image)
+        _write_image(live_path, image)
+
+        with patch(
+            "imagecmp.alignment.cv2.findTransformECC",
+            side_effect=RuntimeError("controlled ECC failure"),
+        ):
+            result = service.compare(
+                standard_path,
+                live_path,
+                "17 0.5 0.5 0.4 0.5",
+                tmp_path / "out",
+                _write_calibrated_config(tmp_path),
+            )
+
+        assert result.state == ComparisonState.DETECTION_UNAVAILABLE
+        assert result.unavailable_reason is not None
+        assert "ECC refinement did not converge" in result.unavailable_detail
+        assert result.alignment_metrics["ecc_attempted"] == 1
+        assert result.alignment_metrics["ecc_converged"] == 0
+        assert result.artifacts is not None
+        difference_mask = cv2.imread(str(result.artifacts.difference_mask), cv2.IMREAD_GRAYSCALE)
+        assert difference_mask is not None and cv2.countNonZero(difference_mask) == 0
+
+
+def test_zoom_parent_child_signature_is_match_uncertain():
+    """Near-identity H plus local-only matches and ECC failure is not usable."""
+    service = ImageComparisonService()
+    patch_image = _create_textured_image(120, 100)
+    standard = np.zeros((240, 320, 3), dtype=np.uint8)
+    live = np.full((240, 320, 3), 100, dtype=np.uint8)
+    standard[20:120, 20:140] = patch_image
+    live[20:120, 20:140] = patch_image
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        standard_path = tmp_path / "standard.png"
+        live_path = tmp_path / "live.png"
+        _write_image(standard_path, standard)
+        _write_image(live_path, live)
+        config = _calibrated_config_payload("zoom-signature-v1")
+        config["alignment"]["spatial_coverage_min"] = 0.01
+        config_path = tmp_path / "config.json"
+        config_path.write_text(json.dumps(config), encoding="utf-8")
+
+        with patch(
+            "imagecmp.alignment.cv2.findTransformECC",
+            side_effect=RuntimeError("controlled ECC failure"),
+        ):
+            result = service.compare(
+                standard_path,
+                live_path,
+                "17 0.5 0.5 1.0 1.0",
+                tmp_path / "out",
+                config_path,
+            )
+
+        assert result.state == ComparisonState.DETECTION_UNAVAILABLE
+        assert result.unavailable_reason is not None
+        assert result.unavailable_reason.value == "match_uncertain"
+        assert result.alignment_metrics["near_identity_transform"] == 1
+        assert result.alignment_metrics["suspected_zoom_parent_child_mismatch"] == 1
+        assert "zoom/parent-child" in result.unavailable_detail
+
+
+def test_post_alignment_appearance_inconsistency_is_match_uncertain():
+    """A globally mapped but visually inconsistent component is not a change call."""
+    service = ImageComparisonService()
+    standard = _create_textured_image()
+    live = standard.copy()
+    live[60:180, 96:224] = np.random.RandomState(9).randint(
+        0, 256, (120, 128, 3), dtype=np.uint8
+    )
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        standard_path = tmp_path / "standard.png"
+        live_path = tmp_path / "live.png"
+        _write_image(standard_path, standard)
+        _write_image(live_path, live)
+        config = _calibrated_config_payload("appearance-gate-v1")
+        config["alignment"]["appearance_ncc_min"] = 0.90
+        config["alignment"]["appearance_ssim_min"] = 0.90
+        config_path = tmp_path / "config.json"
+        config_path.write_text(json.dumps(config), encoding="utf-8")
+
+        result = service.compare(
+            standard_path,
+            live_path,
+            "17 0.5 0.5 0.4 0.5",
+            tmp_path / "out",
+            config_path,
+        )
+
+        assert result.state == ComparisonState.DETECTION_UNAVAILABLE
+        assert result.unavailable_reason is not None
+        assert result.unavailable_reason.value == "match_uncertain"
+        assert "post-alignment appearance" in result.unavailable_detail
+        assert result.alignment_metrics["candidate_localized"] == 1
+        assert result.alignment_metrics["component_mapping_usable"] == 0
+
+
+def test_coarser_live_component_resolution_controls_comparison_scale():
+    """The evidence records and uses the live component's coarser resolution."""
+    service = ImageComparisonService()
+    standard = _create_textured_image()
+    live = cv2.resize(standard, (160, 120), interpolation=cv2.INTER_AREA)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        standard_path = tmp_path / "standard.png"
+        live_path = tmp_path / "live.png"
+        _write_image(standard_path, standard)
+        _write_image(live_path, live)
+        result = service.compare(
+            standard_path,
+            live_path,
+            "17 0.5 0.5 0.4 0.5",
+            tmp_path / "out",
+            _write_calibrated_config(tmp_path),
+        )
+
+        assert result.state != ComparisonState.DETECTION_UNAVAILABLE
+        assert 0.25 < result.alignment_metrics["effective_resolution_scale"] < 0.75
+        assert result.alignment_metrics["comparison_processing_scale"] < 1.0
+
+
+def test_too_coarse_live_component_is_explicitly_unavailable():
+    """A calibrated resolution floor prevents an upsampled fine-detail decision."""
+    service = ImageComparisonService()
+    standard = _create_textured_image()
+    live = cv2.resize(standard, (160, 120), interpolation=cv2.INTER_AREA)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        standard_path = tmp_path / "standard.png"
+        live_path = tmp_path / "live.png"
+        _write_image(standard_path, standard)
+        _write_image(live_path, live)
+        config = _calibrated_config_payload("resolution-floor-v1")
+        config["alignment"]["effective_resolution_scale_min"] = 0.75
+        config_path = tmp_path / "config.json"
+        config_path.write_text(json.dumps(config), encoding="utf-8")
+
+        result = service.compare(
+            standard_path,
+            live_path,
+            "17 0.5 0.5 0.4 0.5",
+            tmp_path / "out",
+            config_path,
+        )
+
+        assert result.state == ComparisonState.DETECTION_UNAVAILABLE
+        assert result.unavailable_reason is not None
+        assert result.unavailable_reason.value == "match_uncertain"
+        assert "resolution is too coarse" in result.unavailable_detail
+        assert result.alignment_metrics["comparison_processing_scale"] < 1.0
+
+
 def test_explicit_missing_config_is_an_error():
     """An explicit but absent configuration must not silently use defaults."""
     service = ImageComparisonService()
@@ -746,9 +914,21 @@ def _run_tests() -> int:
          test_detection_regions_use_live_image_coordinates),
         ("unreliable_alignment_is_unavailable_with_artifacts",
          test_unreliable_alignment_is_unavailable_with_artifacts),
+        ("ecc_non_convergence_is_negative_alignment_evidence",
+         test_ecc_non_convergence_is_negative_alignment_evidence),
+        ("zoom_parent_child_signature_is_match_uncertain",
+         test_zoom_parent_child_signature_is_match_uncertain),
+        ("post_alignment_appearance_inconsistency_is_match_uncertain",
+         test_post_alignment_appearance_inconsistency_is_match_uncertain),
+        ("coarser_live_component_resolution_controls_comparison_scale",
+         test_coarser_live_component_resolution_controls_comparison_scale),
+        ("too_coarse_live_component_is_explicitly_unavailable",
+         test_too_coarse_live_component_is_explicitly_unavailable),
         ("explicit_missing_config_is_an_error", test_explicit_missing_config_is_an_error),
         ("invalid_config_is_an_error", test_invalid_config_is_an_error),
         ("daily_detection_requires_config", test_daily_detection_requires_config),
+        ("daily_detection_rejects_development_configuration",
+         test_daily_detection_rejects_development_configuration),
         ("calibration_observation_has_no_business_state",
          test_calibration_observation_has_no_business_state),
         ("multi_reference_selects_trusted_reference_and_aggregates_components",

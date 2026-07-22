@@ -10,6 +10,7 @@ with conservative OR-fusion across channels.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -36,6 +37,7 @@ def compare_aligned(
     valid_mask: Optional[np.ndarray],
     roi_rect: tuple[int, int, int, int],
     config: CalibratedConfig,
+    processing_scale: float = 1.0,
 ) -> CompareResult:
     """Detect changes between aligned standard and live images.
 
@@ -46,11 +48,16 @@ def compare_aligned(
                     or None to use the whole image.
         roi_rect: (x, y, w, h) in standard-image pixel coordinates.
         config: Loaded calibration configuration.
+        processing_scale: Linear sampling scale in (0, 1].  A value below
+            one evaluates both images at their coarser common resolution and
+            maps the evidence back to standard-image coordinates.
 
     Returns:
         CompareResult with the difference mask, heatmap, and detected regions.
     """
     th = config.detection
+    if not 0.0 < processing_scale <= 1.0:
+        raise ValueError("processing_scale must be in (0, 1]")
     rx, ry, rw, rh = roi_rect
 
     # Clamp ROI to image bounds
@@ -72,6 +79,18 @@ def compare_aligned(
     else:
         valid = np.ones((rh, rw), dtype=np.float32)
     valid_pixel_ratio = float(np.mean(valid))
+
+    process_width = max(1, int(round(rw * processing_scale)))
+    process_height = max(1, int(round(rh * processing_scale)))
+    scale_x = rw / process_width
+    scale_y = rh / process_height
+    if process_width != rw or process_height != rh:
+        # Downsampling is intentional: upsampling a sparse live component
+        # would manufacture pixels and make a fine-detail decision look more
+        # certain than the native evidence allows.
+        std_roi = cv2.resize(std_roi, (process_width, process_height), interpolation=cv2.INTER_AREA)
+        live_roi = cv2.resize(live_roi, (process_width, process_height), interpolation=cv2.INTER_AREA)
+        valid = cv2.resize(valid, (process_width, process_height), interpolation=cv2.INTER_NEAREST)
 
     # ----- Channel 1: Lab ΔE (CIE76) ---------------------------------------
     std_lab = cv2.cvtColor((std_roi / 255.0).astype(np.float32), cv2.COLOR_BGR2Lab)
@@ -138,7 +157,9 @@ def compare_aligned(
         region_mask = (labels == i)
         confidence = float(np.mean(heatmap[region_mask]))
 
-        # Map coordinates back to full standard-image frame
+        # Map coordinates back to full standard-image frame.  The evidence
+        # was deliberately evaluated at the coarse native scale, but callers
+        # still receive boxes in standard/live-image coordinates.
         evidence_channels = []
         mean_lab = float(np.mean(lab_score[region_mask]))
         mean_grad = float(np.mean(grad_score[region_mask]))
@@ -152,10 +173,10 @@ def compare_aligned(
             evidence_channels.append("low_confidence_candidate")
 
         regions.append(DetectionRegion(
-            x=rx + x,
-            y=ry + y,
-            width=w,
-            height=h,
+            x=rx + int(math.floor(x * scale_x)),
+            y=ry + int(math.floor(y * scale_y)),
+            width=max(1, int(math.ceil(w * scale_x))),
+            height=max(1, int(math.ceil(h * scale_y))),
             confidence=confidence,
             evidence_channels=evidence_channels,
         ))
@@ -163,11 +184,15 @@ def compare_aligned(
     # Build full-size masks for artifact writing
     full_binary = np.zeros((H, W), dtype=np.uint8)
     if rh > 0 and rw > 0:
-        full_binary[ry:ry + rh, rx:rx + rw] = binary
+        full_binary[ry:ry + rh, rx:rx + rw] = cv2.resize(
+            binary, (rw, rh), interpolation=cv2.INTER_NEAREST
+        )
 
     full_heatmap = np.zeros((H, W), dtype=np.float32)
     if rh > 0 and rw > 0:
-        full_heatmap[ry:ry + rh, rx:rx + rw] = heatmap
+        full_heatmap[ry:ry + rh, rx:rx + rw] = cv2.resize(
+            heatmap, (rw, rh), interpolation=cv2.INTER_LINEAR
+        )
 
     return CompareResult(
         difference_mask=full_binary,

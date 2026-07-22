@@ -36,8 +36,15 @@ def write_alignment_image(
     output_dir: Path,
     status_text: str = "",
     filename: str = "alignment.png",
+    inlier_standard_points: Optional[np.ndarray] = None,
+    inlier_live_points: Optional[np.ndarray] = None,
 ) -> Path:
-    """Write an alignment diagnostic, with a clear fallback when no map exists."""
+    """Write an alignment diagnostic, with a clear fallback when no map exists.
+
+    RANSAC inliers are shown as yellow links.  This exposes the actual
+    correspondence evidence rather than making a projected image outline look
+    like proof that the expected component was found.
+    """
     standard_height, standard_width = standard_bgr.shape[:2]
     live_height, live_width = live_bgr.shape[:2]
     canvas = np.zeros((max(standard_height, live_height), standard_width + live_width, 3), dtype=np.uint8)
@@ -57,6 +64,23 @@ def write_alignment_image(
             cv2.line(canvas, start, end, (0, 255, 0), 2)
     else:
         status_text = status_text or "Alignment unavailable: no trusted geometric map"
+
+    if (inlier_standard_points is not None and inlier_live_points is not None
+            and inlier_standard_points.shape == inlier_live_points.shape
+            and inlier_standard_points.ndim == 2
+            and inlier_standard_points.shape[1] == 2):
+        # The evidence can contain many points; a bounded, deterministic
+        # sample keeps the artifact legible while still proving spatial spread.
+        count = inlier_standard_points.shape[0]
+        step = max(1, int(np.ceil(count / 120)))
+        for standard_point, live_point in zip(
+            inlier_standard_points[::step], inlier_live_points[::step]
+        ):
+            start = tuple(np.rint(standard_point).astype(int))
+            end = tuple(np.rint(live_point).astype(int) + np.array([standard_width, 0]))
+            cv2.circle(canvas, start, 2, (0, 255, 255), -1)
+            cv2.circle(canvas, end, 2, (0, 255, 255), -1)
+            cv2.line(canvas, start, end, (0, 180, 180), 1, cv2.LINE_AA)
 
     if status_text:
         cv2.putText(
@@ -151,6 +175,8 @@ def write_all_artifacts(
     detections: list[DetectionRegion],
     output_dir: Path,
     status_text: str = "",
+    inlier_standard_points: Optional[np.ndarray] = None,
+    inlier_live_points: Optional[np.ndarray] = None,
 ) -> ArtifactSet:
     """Write the complete evidence set, synthesising diagnostics where needed."""
     height, width = standard_bgr.shape[:2]
@@ -161,7 +187,13 @@ def write_all_artifacts(
                           else np.zeros((height, width), dtype=np.float32))
     return ArtifactSet(
         alignment_image=write_alignment_image(
-            standard_bgr, live_bgr, H, output_dir, status_text=status_text
+            standard_bgr,
+            live_bgr,
+            H,
+            output_dir,
+            status_text=status_text,
+            inlier_standard_points=inlier_standard_points,
+            inlier_live_points=inlier_live_points,
         ),
         valid_mask=write_valid_mask(valid_mask, output_dir),
         difference_mask=write_difference_mask(difference_mask, output_dir),

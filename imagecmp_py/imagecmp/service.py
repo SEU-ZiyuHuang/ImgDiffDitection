@@ -18,6 +18,7 @@ from .alignment import AlignmentDiagnostic, AlignmentResult, align
 from .artifacts import write_all_artifacts
 from .compare import CompareResult, compare_aligned
 from .config import CalibratedConfig, default_config, load_config
+from .mapping import ComponentMappingEvidence, evaluate_component_mapping
 from .references import read_color_image
 from .result import (
     ArtifactSet,
@@ -162,6 +163,48 @@ class ImageComparisonService:
             _project_rect(standard_rect, standard_to_live, live.shape[:2])
             if standard_to_live is not None else supplied_live_rect
         )
+        mapping: Optional[ComponentMappingEvidence] = None
+        aligned_live: Optional[np.ndarray] = None
+        if standard_to_live is not None:
+            try:
+                live_to_standard = np.linalg.inv(standard_to_live)
+            except np.linalg.LinAlgError:
+                detail = "final standard-to-live transform is singular"
+                artifacts = _write_unavailable_artifacts(
+                    standard, live, alignment, projected_live_rect, output_dir, detail
+                )
+                return ComparisonResult(
+                    state=ComparisonState.DETECTION_UNAVAILABLE,
+                    unavailable_reason=UnavailableReason.ALIGNMENT_FAILED,
+                    unavailable_detail=detail,
+                    artifacts=artifacts,
+                    alignment_metrics=metrics,
+                    config_version=config.version,
+                )
+
+            aligned_live = cv2.warpPerspective(
+                live,
+                live_to_standard,
+                (standard.shape[1], standard.shape[0]),
+                flags=cv2.INTER_LINEAR,
+                borderMode=cv2.BORDER_CONSTANT,
+                borderValue=0,
+            )
+            # Even when the image-level alignment later proves unreliable,
+            # retain every component-level observation that the available map
+            # permits.  This keeps unavailable results diagnosable.
+            mapping = evaluate_component_mapping(
+                standard_bgr=standard,
+                aligned_live_bgr=aligned_live,
+                valid_mask=alignment.valid_mask,
+                standard_to_live=standard_to_live,
+                roi_rect=standard_rect,
+                live_shape=live.shape[:2],
+                config=config,
+            )
+            metrics.update(mapping.as_metrics_dict())
+            if mapping.candidate_live_rect is not None:
+                projected_live_rect = mapping.candidate_live_rect
 
         if alignment.diagnostic != AlignmentDiagnostic.USABLE:
             detail = "; ".join(alignment.diagnostic_reasons) or "alignment quality is unavailable"
@@ -182,8 +225,8 @@ class ImageComparisonService:
                 config_version=config.version,
             )
 
-        if standard_to_live is None:
-            detail = "alignment reported usable without a standard-to-live map"
+        if standard_to_live is None or aligned_live is None:
+            detail = "alignment reported usable without a usable standard-to-live map"
             artifacts = _write_unavailable_artifacts(
                 standard, live, alignment, projected_live_rect, output_dir, detail
             )
@@ -196,57 +239,38 @@ class ImageComparisonService:
                 config_version=config.version,
             )
 
-        try:
-            live_to_standard = np.linalg.inv(standard_to_live)
-        except np.linalg.LinAlgError:
-            detail = "final standard-to-live transform is singular"
+        if mapping is None or not mapping.usable:
+            detail = (
+                mapping.failure_detail
+                if mapping is not None and mapping.failure_detail
+                else "expected-component mapping evidence is unavailable"
+            )
+            reason = (
+                mapping.failure_reason
+                if mapping is not None and mapping.failure_reason is not None
+                else UnavailableReason.MATCH_UNCERTAIN
+            )
             artifacts = _write_unavailable_artifacts(
                 standard, live, alignment, projected_live_rect, output_dir, detail
             )
             return ComparisonResult(
                 state=ComparisonState.DETECTION_UNAVAILABLE,
-                unavailable_reason=UnavailableReason.ALIGNMENT_FAILED,
+                unavailable_reason=reason,
                 unavailable_detail=detail,
                 artifacts=artifacts,
                 alignment_metrics=metrics,
                 config_version=config.version,
             )
 
-        aligned_live = cv2.warpPerspective(
-            live,
-            live_to_standard,
-            (standard.shape[1], standard.shape[0]),
-            flags=cv2.INTER_LINEAR,
-            borderMode=cv2.BORDER_CONSTANT,
-            borderValue=0,
-        )
         comparison = compare_aligned(
             standard_bgr=standard,
             aligned_live_bgr=aligned_live,
             valid_mask=alignment.valid_mask,
             roi_rect=standard_rect,
             config=config,
+            processing_scale=mapping.comparison_scale,
         )
         metrics["roi_valid_overlap_ratio"] = comparison.valid_pixel_ratio
-
-        if comparison.valid_pixel_ratio < config.alignment.roi_valid_overlap_ratio_min:
-            detail = (
-                "ROI valid overlap below configured minimum "
-                f"({comparison.valid_pixel_ratio:.3f} < "
-                f"{config.alignment.roi_valid_overlap_ratio_min:.3f})"
-            )
-            artifacts = _write_artifacts(
-                standard, live, standard_to_live, alignment, comparison,
-                projected_live_rect, [], output_dir, detail,
-            )
-            return ComparisonResult(
-                state=ComparisonState.DETECTION_UNAVAILABLE,
-                unavailable_reason=UnavailableReason.ALIGNMENT_FAILED,
-                unavailable_detail=detail,
-                artifacts=artifacts,
-                alignment_metrics=metrics,
-                config_version=config.version,
-            )
 
         live_regions = _map_regions_to_live(
             comparison.detection_regions, standard_to_live, live.shape[:2]
@@ -355,7 +379,8 @@ def _map_regions_to_live(
 def _unavailable_reason(alignment: AlignmentResult) -> UnavailableReason:
     return (
         UnavailableReason.MATCH_UNCERTAIN
-        if alignment.homography is None else UnavailableReason.ALIGNMENT_FAILED
+        if alignment.homography is None or alignment.suspected_zoom_parent_child_mismatch
+        else UnavailableReason.ALIGNMENT_FAILED
     )
 
 
@@ -382,6 +407,8 @@ def _write_artifacts(
             detections=detections,
             output_dir=output_dir,
             status_text=detail,
+            inlier_standard_points=alignment.inlier_standard_points,
+            inlier_live_points=alignment.inlier_live_points,
         )
     except Exception as exc:
         raise RuntimeError(f"failed to write evidence artifacts: {exc}") from exc

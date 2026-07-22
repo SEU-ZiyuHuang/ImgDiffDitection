@@ -37,7 +37,21 @@ ALIGNMENT_METRIC_KEYS = (
     "projected_area_ratio",
     "valid_overlap_ratio",
     "ecc_correlation",
+    "roi_valid_overlap_ratio",
+    "appearance_ncc",
+    "appearance_ssim",
+    "effective_resolution_scale",
+    "effective_live_width_pixels",
+    "effective_live_height_pixels",
 )
+
+# Fixed comparison point from the pre-#6 local calibration run.  This is a
+# reliability baseline only; it is not an anomaly-accuracy metric.
+SUSPECT_FALSE_USABLE_BASELINE = {
+    "date": "2026-07-22",
+    "suspect_components": 29,
+    "usable_components": 628,
+}
 
 
 def parse_arguments() -> argparse.Namespace:
@@ -127,6 +141,30 @@ def _alignment_distributions(records: Iterable[dict[str, Any]]) -> dict[str, dic
     }
 
 
+def _is_near_identity(row: dict[str, Any]) -> bool:
+    center = _finite_number(row.get("center_displacement_relative_diagonal"))
+    area_ratio = _finite_number(row.get("projected_area_ratio"))
+    return bool(
+        center is not None and center <= 0.05
+        and area_ratio is not None and abs(area_ratio - 1.0) <= 0.15
+    )
+
+
+def _is_suspect_false_usable_signature(row: dict[str, Any]) -> bool:
+    """Recognize the #6 zoom/parent-child signature from local evidence."""
+    coverage = _finite_number(row.get("spatial_coverage"))
+    ecc_converged = _finite_number(row.get("ecc_converged"))
+    return bool(
+        _is_near_identity(row)
+        and coverage is not None and coverage < 0.20
+        and ecc_converged == 0.0
+    )
+
+
+def _rate(numerator: int, denominator: int) -> float | None:
+    return numerator / denominator if denominator else None
+
+
 def _case_type(case_name: str) -> str:
     return case_name.rsplit("_", 1)[1] if "_" in case_name else "unspecified"
 
@@ -186,6 +224,7 @@ def _write_markdown(path: Path, report: dict[str, Any]) -> None:
     components = report["components"]
     candidates = report["difference_candidates"]
     evidence = report["evidence"]
+    false_usable = report["alignment"]["suspect_false_usable_signature"]
     lines = [
         "# 标定批次详细分析",
         "",
@@ -208,6 +247,17 @@ def _write_markdown(path: Path, report: dict[str, Any]) -> None:
     for name, distribution in report["alignment"]["selected_reference_metrics"].items():
         lines.append(_markdown_distribution(name, distribution))
     lines.extend([
+        "",
+        "## 远近景/父子视图伪可用签名",
+        "",
+        "- 签名：近似恒等单应、空间覆盖度 < 0.20、ECC 未收敛。",
+        f"- 当前批次：{false_usable['current_suspect_components']} / "
+        f"{false_usable['current_usable_components']} 个全图 usable 部件，"
+        f"比例 {format(false_usable['current_rate'], '.2%') if false_usable['current_rate'] is not None else '无可比较分母'}。",
+        f"- 2026-07-22 基线：{false_usable['baseline_suspect_components']} / "
+        f"{false_usable['baseline_usable_components']}，"
+        f"比例 {false_usable['baseline_rate']:.2%}。",
+        f"- 新链路观察到该签名 {false_usable['all_signature_components']} 个；其中仍被标为 usable 的数量才计入当前伪可用率。",
         "",
         "## 部件与差异候选",
         "",
@@ -413,6 +463,20 @@ def analyze(batch_output: Path) -> tuple[dict[str, Any], list[dict[str, Any]], l
         if isinstance(channels, list):
             candidate_channels.update(str(channel) for channel in channels)
 
+    usable_components = [
+        row for row in component_rows if row.get("diagnostic") == "usable"
+    ]
+    signature_components = [
+        row for row in component_rows if _is_suspect_false_usable_signature(row)
+    ]
+    remaining_false_usable = [
+        row for row in usable_components if _is_suspect_false_usable_signature(row)
+    ]
+    baseline_rate = _rate(
+        SUSPECT_FALSE_USABLE_BASELINE["suspect_components"],
+        SUSPECT_FALSE_USABLE_BASELINE["usable_components"],
+    )
+
     report = {
         "report_kind": "calibration_observation_analysis",
         "generated_at_utc": _utc_now(),
@@ -440,6 +504,20 @@ def analyze(batch_output: Path) -> tuple[dict[str, Any], list[dict[str, Any]], l
             "all_reference_metrics": _alignment_distributions(attempts),
             "selected_reference_metrics": _alignment_distributions(selected_attempts),
             "component_metrics": _alignment_distributions(component_rows),
+            "suspect_false_usable_signature": {
+                "definition": (
+                    "near-identity homography, spatial_coverage < 0.20, "
+                    "and ecc_converged == 0"
+                ),
+                "baseline_date": SUSPECT_FALSE_USABLE_BASELINE["date"],
+                "baseline_suspect_components": SUSPECT_FALSE_USABLE_BASELINE["suspect_components"],
+                "baseline_usable_components": SUSPECT_FALSE_USABLE_BASELINE["usable_components"],
+                "baseline_rate": baseline_rate,
+                "all_signature_components": len(signature_components),
+                "current_suspect_components": len(remaining_false_usable),
+                "current_usable_components": len(usable_components),
+                "current_rate": _rate(len(remaining_false_usable), len(usable_components)),
+            },
         },
         "components": {
             "observed_components": len(component_rows),

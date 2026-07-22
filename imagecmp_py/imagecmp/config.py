@@ -41,7 +41,17 @@ class AlignmentThresholds:
     projected_area_ratio_max: float = 5.0
     valid_overlap_ratio_min: float = 0.60
     roi_valid_overlap_ratio_min: float = 0.60
+    candidate_in_frame_ratio_min: float = 0.60
     ecc_correlation_min_when_converged: float = 0.20
+    near_identity_center_displacement_relative_diagonal_max: float = 0.05
+    near_identity_projected_area_ratio_tolerance: float = 0.15
+    zoom_parent_child_spatial_coverage_max: float = 0.20
+
+    appearance_ncc_min: float = 0.35
+    appearance_ssim_min: float = 0.20
+    effective_resolution_scale_min: float = 0.25
+    effective_component_width_min_pixels: int = 24
+    effective_component_height_min_pixels: int = 24
 
 
 @dataclass(frozen=True)
@@ -134,9 +144,42 @@ def _parse_alignment(raw: Any) -> AlignmentThresholds:
         roi_valid_overlap_ratio_min=_finite_number(
             values["roi_valid_overlap_ratio_min"], "alignment.roi_valid_overlap_ratio_min"
         ),
+        candidate_in_frame_ratio_min=_finite_number(
+            values["candidate_in_frame_ratio_min"], "alignment.candidate_in_frame_ratio_min"
+        ),
         ecc_correlation_min_when_converged=_finite_number(
             values["ecc_correlation_min_when_converged"],
             "alignment.ecc_correlation_min_when_converged",
+        ),
+        near_identity_center_displacement_relative_diagonal_max=_finite_number(
+            values["near_identity_center_displacement_relative_diagonal_max"],
+            "alignment.near_identity_center_displacement_relative_diagonal_max",
+        ),
+        near_identity_projected_area_ratio_tolerance=_finite_number(
+            values["near_identity_projected_area_ratio_tolerance"],
+            "alignment.near_identity_projected_area_ratio_tolerance",
+        ),
+        zoom_parent_child_spatial_coverage_max=_finite_number(
+            values["zoom_parent_child_spatial_coverage_max"],
+            "alignment.zoom_parent_child_spatial_coverage_max",
+        ),
+        appearance_ncc_min=_finite_number(
+            values["appearance_ncc_min"], "alignment.appearance_ncc_min"
+        ),
+        appearance_ssim_min=_finite_number(
+            values["appearance_ssim_min"], "alignment.appearance_ssim_min"
+        ),
+        effective_resolution_scale_min=_finite_number(
+            values["effective_resolution_scale_min"],
+            "alignment.effective_resolution_scale_min",
+        ),
+        effective_component_width_min_pixels=_positive_int(
+            values["effective_component_width_min_pixels"],
+            "alignment.effective_component_width_min_pixels",
+        ),
+        effective_component_height_min_pixels=_positive_int(
+            values["effective_component_height_min_pixels"],
+            "alignment.effective_component_height_min_pixels",
         ),
     )
 
@@ -159,8 +202,24 @@ def _parse_alignment(raw: Any) -> AlignmentThresholds:
         raise ValueError("alignment.valid_overlap_ratio_min must be in [0, 1]")
     if not 0.0 <= parsed.roi_valid_overlap_ratio_min <= 1.0:
         raise ValueError("alignment.roi_valid_overlap_ratio_min must be in [0, 1]")
+    if not 0.0 <= parsed.candidate_in_frame_ratio_min <= 1.0:
+        raise ValueError("alignment.candidate_in_frame_ratio_min must be in [0, 1]")
     if not -1.0 <= parsed.ecc_correlation_min_when_converged <= 1.0:
         raise ValueError("alignment.ecc_correlation_min_when_converged must be in [-1, 1]")
+    if not 0.0 <= parsed.near_identity_center_displacement_relative_diagonal_max <= 1.0:
+        raise ValueError(
+            "alignment.near_identity_center_displacement_relative_diagonal_max must be in [0, 1]"
+        )
+    if parsed.near_identity_projected_area_ratio_tolerance < 0.0:
+        raise ValueError("alignment.near_identity_projected_area_ratio_tolerance must be >= 0")
+    if not 0.0 <= parsed.zoom_parent_child_spatial_coverage_max <= 1.0:
+        raise ValueError("alignment.zoom_parent_child_spatial_coverage_max must be in [0, 1]")
+    if not -1.0 <= parsed.appearance_ncc_min <= 1.0:
+        raise ValueError("alignment.appearance_ncc_min must be in [-1, 1]")
+    if not -1.0 <= parsed.appearance_ssim_min <= 1.0:
+        raise ValueError("alignment.appearance_ssim_min must be in [-1, 1]")
+    if not 0.0 < parsed.effective_resolution_scale_min <= 1.0:
+        raise ValueError("alignment.effective_resolution_scale_min must be in (0, 1]")
     return parsed
 
 

@@ -56,6 +56,8 @@ class AlignmentResult:
     inlier_rate: float = _NAN
     reprojection_error_pixels: float = _NAN
     spatial_coverage: float = _NAN
+    inlier_standard_points: Optional[np.ndarray] = None
+    inlier_live_points: Optional[np.ndarray] = None
 
     # Projected geometry (computed only when H is finite and well-behaved)
     projected_geometry_valid: bool = False
@@ -68,12 +70,17 @@ class AlignmentResult:
     # Valid overlap + ECC
     valid_overlap_available: bool = False
     valid_overlap_ratio: float = _NAN
+    ecc_attempted: bool = False
     ecc_converged: bool = False
     ecc_correlation: float = _NAN
+    ecc_failure_detail: str = ""
+    near_identity_transform: bool = False
+    suspected_zoom_parent_child_mismatch: bool = False
 
     # Diagnostic classification
     diagnostic: AlignmentDiagnostic = AlignmentDiagnostic.UNAVAILABLE
     diagnostic_reasons: list[str] = field(default_factory=list)
+    stage_diagnostics: list[str] = field(default_factory=list)
 
     def as_metrics_dict(self) -> dict:
         """Return observed alignment evidence as a flat dict.
@@ -94,11 +101,20 @@ class AlignmentResult:
             ("projected_corners_in_live_frame", self.projected_corners_in_live_frame),
             ("projected_area_ratio", self.projected_area_ratio),
             ("valid_overlap_ratio", self.valid_overlap_ratio),
+            ("ecc_attempted", 1 if self.ecc_attempted else 0),
             ("ecc_converged", 1 if self.ecc_converged else 0),
             ("ecc_correlation", self.ecc_correlation),
+            ("near_identity_transform", 1 if self.near_identity_transform else 0),
+            ("suspected_zoom_parent_child_mismatch", 1 if self.suspected_zoom_parent_child_mismatch else 0),
             ("diagnostic", self.diagnostic.value),
         ]
-        return {k: v for k, v in fields if isinstance(v, (int, str)) or math.isfinite(v)}
+        metrics = {k: v for k, v in fields if isinstance(v, (int, str)) or math.isfinite(v)}
+        metrics["alignment_stages"] = list(self.stage_diagnostics)
+        if self.ecc_failure_detail:
+            metrics["ecc_failure_detail"] = self.ecc_failure_detail
+        if self.diagnostic_reasons:
+            metrics["alignment_diagnostic_reasons"] = list(self.diagnostic_reasons)
+        return metrics
 
 
 # ---------------------------------------------------------------------------
@@ -148,6 +164,7 @@ def align(
     th = config.alignment
 
     # ----- 1. ORB feature extraction ---------------------------------------
+    result.stage_diagnostics.append("feature_correspondence")
     orb = cv2.ORB.create(nfeatures=th.orb_feature_count)
     std_kp, std_desc = orb.detectAndCompute(standard_gray, None)
     live_kp, live_desc = orb.detectAndCompute(live_gray, None)
@@ -177,6 +194,7 @@ def align(
         return result
 
     # ----- 3. RANSAC homography --------------------------------------------
+    result.stage_diagnostics.append("geometric_transform")
     src_pts = np.float32([std_kp[m.queryIdx].pt for m in matches]).reshape(-1, 1, 2)
     dst_pts = np.float32([live_kp[m.trainIdx].pt for m in matches]).reshape(-1, 1, 2)
 
@@ -196,6 +214,8 @@ def align(
     inlier_dst = dst_pts[inlier_mask.ravel() == 1]
     result.inlier_count = len(inlier_src)
     result.inlier_rate = result.inlier_count / result.feature_match_count
+    result.inlier_standard_points = inlier_src.reshape(-1, 2).copy()
+    result.inlier_live_points = inlier_dst.reshape(-1, 2).copy()
 
     if len(inlier_src) > 0:
         projected_inliers = cv2.perspectiveTransform(
@@ -224,6 +244,7 @@ def align(
         except np.linalg.LinAlgError:
             result.diagnostic_reasons.append("homography is singular")
     if H_inv is not None and np.all(np.isfinite(H_inv)):
+        result.stage_diagnostics.append("valid_overlap")
         result.homography_inv = H_inv
         live_mask = np.full(live_gray.shape[:2], 255, dtype=np.uint8)
         valid_mask = cv2.warpPerspective(
@@ -254,6 +275,8 @@ def align(
         # to the current input (already homography-warped live) coordinates.
         # WARP_INVERSE_MAP therefore resamples the input into template space.
         try:
+            result.stage_diagnostics.append("local_refinement_ecc")
+            result.ecc_attempted = True
             ecc_warp = np.eye(2, 3, dtype=np.float32)
             criteria = (
                 cv2.TERM_CRITERIA_COUNT | cv2.TERM_CRITERIA_EPS,
@@ -294,10 +317,13 @@ def align(
 
             ecc_homography = np.vstack([ecc_warp, np.array([0.0, 0.0, 1.0])])
             result.standard_to_live = H @ ecc_homography
-        except (cv2.error, TypeError, RuntimeError):
-            # Non-convergence is a diagnostic observation.  The homography
-            # result remains available for the quality gate below.
-            pass
+        except (cv2.error, TypeError, RuntimeError) as exc:
+            # A failed local refinement is negative evidence.  The initial
+            # homography remains in the record for diagnostics, but it cannot
+            # silently pass a comparison gate that requires ECC convergence.
+            result.ecc_failure_detail = (
+                f"ECC refinement did not converge ({type(exc).__name__})"
+            )
 
     # ----- 8. Diagnostic classification ------------------------------------
     _classify_diagnostic(result, th)
@@ -374,7 +400,10 @@ def _classify_diagnostic(result: AlignmentResult, th) -> None:
     Args:
         th: AlignmentThresholds from the loaded config.
     """
-    reasons: list[str] = []
+    # Preserve observations gathered before a structural early exit (for
+    # example, descriptor extraction or RANSAC estimation).  They are stage
+    # diagnostics, not silently replaced by the generic final status.
+    reasons: list[str] = list(result.diagnostic_reasons)
 
     # Structural blockers → unavailable
     if result.homography is None:
@@ -430,11 +459,24 @@ def _classify_diagnostic(result: AlignmentResult, th) -> None:
         reasons.append(
             f"valid overlap below diagnostic minimum ({th.valid_overlap_ratio_min})"
         )
+    if not result.ecc_converged:
+        reasons.append("ECC refinement did not converge")
     if (result.ecc_converged
             and result.ecc_correlation < th.ecc_correlation_min_when_converged):
         reasons.append(
             "ECC correlation below diagnostic minimum after convergence "
             f"({th.ecc_correlation_min_when_converged})"
+        )
+
+    result.near_identity_transform = _is_near_identity(result, th)
+    if (result.near_identity_transform
+            and math.isfinite(result.spatial_coverage)
+            and result.spatial_coverage < th.zoom_parent_child_spatial_coverage_max
+            and not result.ecc_converged):
+        result.suspected_zoom_parent_child_mismatch = True
+        reasons.append(
+            "suspected zoom/parent-child view mismatch: near-identity transform, "
+            "low inlier spatial coverage, and ECC non-convergence"
         )
 
     if reasons:
@@ -443,3 +485,15 @@ def _classify_diagnostic(result: AlignmentResult, th) -> None:
         result.diagnostic = AlignmentDiagnostic.USABLE
 
     result.diagnostic_reasons = reasons
+
+
+def _is_near_identity(result: AlignmentResult, th) -> bool:
+    """Return whether the image-level transform is effectively identity-like."""
+    return bool(
+        math.isfinite(result.center_displacement_relative_diagonal)
+        and result.center_displacement_relative_diagonal
+        <= th.near_identity_center_displacement_relative_diagonal_max
+        and math.isfinite(result.projected_area_ratio)
+        and abs(result.projected_area_ratio - 1.0)
+        <= th.near_identity_projected_area_ratio_tolerance
+    )

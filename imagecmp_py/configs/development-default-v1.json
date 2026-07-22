@@ -15,7 +15,16 @@
     "projected_area_ratio_max": 5.0,
     "valid_overlap_ratio_min": 0.6,
     "roi_valid_overlap_ratio_min": 0.6,
-    "ecc_correlation_min_when_converged": 0.2
+    "candidate_in_frame_ratio_min": 0.6,
+    "ecc_correlation_min_when_converged": 0.2,
+    "near_identity_center_displacement_relative_diagonal_max": 0.05,
+    "near_identity_projected_area_ratio_tolerance": 0.15,
+    "zoom_parent_child_spatial_coverage_max": 0.2,
+    "appearance_ncc_min": 0.35,
+    "appearance_ssim_min": 0.2,
+    "effective_resolution_scale_min": 0.25,
+    "effective_component_width_min_pixels": 24,
+    "effective_component_height_min_pixels": 24
   },
   "detection": {
     "lab_delta_e_threshold": 8.0,
