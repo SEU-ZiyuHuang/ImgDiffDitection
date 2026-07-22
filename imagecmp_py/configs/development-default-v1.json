@@ -1,0 +1,28 @@
+{
+  "version": "development-default-v1",
+  "alignment": {
+    "orb_feature_count": 2000,
+    "match_ratio_test_max": 0.75,
+    "ransac_reprojection_threshold_pixels": 3.0,
+    "ecc_max_iterations": 50,
+    "ecc_epsilon": 0.00001,
+    "feature_match_count_min": 12,
+    "inlier_count_min": 8,
+    "inlier_rate_min": 0.4,
+    "reprojection_error_pixels_max": 3.0,
+    "spatial_coverage_min": 0.02,
+    "projected_area_ratio_min": 0.2,
+    "projected_area_ratio_max": 5.0,
+    "valid_overlap_ratio_min": 0.6,
+    "roi_valid_overlap_ratio_min": 0.6,
+    "ecc_correlation_min_when_converged": 0.2
+  },
+  "detection": {
+    "lab_delta_e_threshold": 8.0,
+    "gradient_magnitude_diff_threshold": 30.0,
+    "difference_decision_threshold": 0.5,
+    "morphology_kernel_size": 1,
+    "min_detection_area_pixels": 100,
+    "min_detection_confidence": 0.3
+  }
+}
