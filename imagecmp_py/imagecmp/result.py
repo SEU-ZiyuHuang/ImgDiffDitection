@@ -23,6 +23,17 @@ class UnavailableReason(Enum):
     ALIGNMENT_FAILED = "alignment_failed"
 
 
+class ComparisonMode(Enum):
+    """Public operating modes.
+
+    Calibration mode intentionally has no business-state result.  Daily
+    detection mode is the only mode that may return ``ComparisonState``.
+    """
+
+    CALIBRATION = "calibration"
+    DAILY_DETECTION = "daily_detection"
+
+
 @dataclass(frozen=True)
 class DetectionRegion:
     """A detected region in the original live-image pixel coordinate frame."""
@@ -61,10 +72,68 @@ class ComparisonResult:
 
 @dataclass(frozen=True)
 class ComponentConclusion:
-    """A component-level conclusion, reserved for image-level aggregation."""
+    """A daily-detection conclusion for one expected component."""
 
+    component_index: int
+    category: str
     state: ComparisonState
     unavailable_reason: Optional[UnavailableReason] = None
     unavailable_detail: str = ""
     detection_regions: list[DetectionRegion] = field(default_factory=list)
+    artifacts: Optional[ArtifactSet] = None
     alignment_metrics: dict = field(default_factory=dict)
+    config_version: str = ""
+
+
+@dataclass(frozen=True)
+class ReferenceAttempt:
+    """Alignment evidence for one reference-image candidate.
+
+    The selected reference is chosen once at image level and is then used for
+    every component.  This prevents a single image result from combining
+    incompatible coordinate systems from different reference images.
+    """
+
+    reference_id: str
+    reference_path: Path
+    alignment_diagnostic: str
+    alignment_metrics: dict = field(default_factory=dict)
+    selected: bool = False
+
+
+@dataclass(frozen=True)
+class ImageComparisonResult:
+    """Daily-detection result for all expected components in one image."""
+
+    state: ComparisonState
+    selected_reference_id: str
+    selected_reference_path: Path
+    reference_attempts: list[ReferenceAttempt]
+    component_conclusions: list[ComponentConclusion]
+    manifest_path: Path
+    config_version: str
+
+
+@dataclass(frozen=True)
+class CalibrationComponentObservation:
+    """Raw observation for one component; it is not a business conclusion."""
+
+    component_index: int
+    category: str
+    alignment_metrics: dict = field(default_factory=dict)
+    difference_candidate_count: int = 0
+    difference_regions: list[DetectionRegion] = field(default_factory=list)
+    observation_detail: str = ""
+    artifacts: Optional[ArtifactSet] = None
+
+
+@dataclass(frozen=True)
+class CalibrationObservation:
+    """Calibration-mode output with no normal/anomaly business state."""
+
+    selected_reference_id: str
+    selected_reference_path: Path
+    reference_attempts: list[ReferenceAttempt]
+    component_observations: list[CalibrationComponentObservation]
+    manifest_path: Path
+    processing_profile_version: str

@@ -1,73 +1,97 @@
-# imagecmp_py：供电设备单部件图像异动检测（#4）
+# imagecmp_py：供电设备图像异动检测
 
-这是新的 Python 实现边界。调用方提交标准图、实时图、标准图中的一个 YOLO ROI、版本化配置和本地证据目录；服务只比较这个预期部件，不推断设备、机位或部件身份。
+这是供电设备图像异动检测模块的 Python 实现。它比较标准图与实时图，先确认两张图能否可靠重合，再比较调用方指定的预期部件。
 
-它实现的是 #4 的单部件检测切片。整图多 ROI 聚合、内网标定与上线可用性门槛属于后续阶段。
+模块有两种明确的运行模式：
+
+- **日常检测模式**：必须加载完整、带版本号的标定配置；输出部件和整图的业务结论。
+- **标定模式**：只输出对齐指标、差异候选和证据图；绝不输出正常或异动的业务结论。
 
 ## 安装与测试
 
 ```powershell
-& "C:\Users\47326\AppData\Local\Programs\Python\Python312\python.exe" -m pip install -r requirements.txt
-& "C:\Users\47326\AppData\Local\Programs\Python\Python312\python.exe" test_service.py
+python -m pip install -r .\imagecmp_py\requirements-dev.txt
+python -m pytest .\imagecmp_py\test_service.py -q
 ```
 
-测试只生成合成图片，不读取或外发 `all_test/` 中的涉密数据。
+自动测试仅使用程序生成的合成图片，不读取或外发 `all_test/` 中的内部样本。
 
-## 调用方式
+## 日常检测模式
 
-```python
-from pathlib import Path
-from imagecmp import ImageComparisonService
+日常检测必须提供完整标定配置。配置缺失、配置不存在、配置字段不完整或数值非法时，程序直接报错，而不会使用开发默认值给出业务结论。
 
-result = ImageComparisonService().compare(
-    standard_path=Path("标准图.jpg"),
-    live_path=Path("实时图.jpg"),
-    roi="17 0.5 0.5 0.4 0.5",
-    config_path=Path("configs/development-default-v1.json"),
-    output_dir=Path("./output"),
-)
-
-print(result.state.value)
-for region in result.detection_regions:
-    # 坐标相对于原始实时图
-    print(region.x, region.y, region.width, region.height, region.confidence)
-```
-
-命令行入口：
+### 单个部件
 
 ```powershell
-python cli.py compare `
+python .\imagecmp_py\cli.py compare `
   --standard 标准图.jpg `
   --live 实时图.jpg `
   --roi "17 0.5 0.5 0.4 0.5" `
-  --config configs/development-default-v1.json `
-  --output .\output
+  --config 标定配置.json `
+  --output .\output\single-component
 ```
 
-`config_path` 省略时只会使用带有 `development-default-v1` 版本号的开发配置，且会向标准错误输出警告；它只用于本地合成测试。日常检测必须传入完整、经内网标定的 JSON 配置。显式传入不存在、缺字段或无效的配置会抛出异常，绝不会静默改用默认值。
+部件框格式为：`类别 中心横坐标 中心纵坐标 宽 高`，四个坐标均已归一化到零至一。
 
-## 三种对外状态
+### 一个案例中的多个部件和多张参考图
 
-| 状态 | 含义 |
+案例目录支持以下本地文件约定：
+
+```text
+案例目录/
+├─ 对比截图.jpg
+├─ 标准源图.jpg
+├─ 新增标准源图0.jpg          （可选）
+├─ 新增标准源图1.jpg          （可选，编号必须连续）
+└─ 标准源图坐标.txt
+```
+
+全部参考图共享同一份部件框文件。程序会先分别评估每张参考图与实时图的对齐质量，再选择一张最可信的参考图供**全部部件**使用；不会对不同部件任意混用不同参考图。
+
+```powershell
+python .\imagecmp_py\cli.py compare-case `
+  --case-directory .\all_test\某个案例目录 `
+  --config 标定配置.json `
+  --output .\output\daily-case
+```
+
+整图汇总规则：
+
+| 部件结果 | 整图结果 |
 | --- | --- |
-| `no_change_high_confidence` | 配准质量和 ROI 有效重叠均通过配置门槛，未检出差异候选。 |
-| `change_detected` | 配准可信，且至少一个颜色或梯度差异候选达到配置的判定边界。 |
-| `detection_unavailable` | 图像可读且请求有效，但特征匹配或配准质量不足。结果包含 `match_uncertain` 或 `alignment_failed` 原因，绝不显示为正常。 |
+| 任意部件检出异动 | `change_detected` |
+| 无异动但任意部件检测不可用 | `detection_unavailable` |
+| 全部部件均高置信无异动 | `no_change_high_confidence` |
 
-缺失文件、图片无法解码、ROI 不合法、配置不合法或证据目录无法写入属于显式 Python 异常，不会被编码成上述业务状态。
+只有最后一种情况才允许整图显示正常。
 
-每个有效比较调用（包括 `detection_unavailable`）都会在调用方指定的本地目录写入以下五个证据文件：
+## 标定模式
 
-| 文件 | 内容 |
-| --- | --- |
-| `alignment.png` | 标准图与实时图的配准诊断；没有可信变换时会明确标示。 |
-| `valid_mask.png` | 标准坐标系中可用于比较的重叠像素。 |
-| `difference_mask.png` | 标准坐标系中的二值差异候选。 |
-| `difference_heatmap.png` | 差异分数热力图。 |
-| `annotated.png` | 原始实时图上的 ROI、差异框与不可用状态说明。 |
+标定模式用于内部正常样本分析。它会记录参考图选择、特征匹配、对齐质量、有效比较区域、差异候选和证据图，但不会输出正常、异动或整图业务结论。
 
-## 当前算法边界
+```powershell
+python .\imagecmp_py\cli.py calibrate-case `
+  --case-directory .\all_test\某个案例目录 `
+  --output .\output\calibration-case
+```
 
-当前实现先用 ORB 特征、RANSAC 单应矩阵和 ECC 精调将实时图变换到标准坐标系，生成有效重叠 mask；只有质量门槛通过后才比较 Lab 颜色差与梯度幅值差。差异通道采用保守 OR 融合：小候选和低置信候选仍被保留并标注，而不会因为面积过滤而被静默当作无异动。
+可选的 `--processing-config` 用于指定完整处理配置；省略时使用开发处理配置，仅供生成原始观察指标。
 
-仓库根目录的 ONNX 模型来源与输入/输出契约已由 #3 记录，但 #4 的 Python 实现不把这些预训练模型伪称为设备身份或缺陷分类器，也不因此作出召回率、漏检率或生产准确率承诺。`development-default-v1.json` 不是标定结果，不能用于生产上线。
+## 输出内容
+
+每个部件目录都包含：
+
+- `alignment.png`：对齐诊断图；
+- `valid_mask.png`：可比较像素区域；
+- `difference_mask.png`：差异候选区域；
+- `difference_heatmap.png`：差异程度图；
+- `annotated.png`：实时图中的部件框和差异框。
+
+日常检测额外写入 `daily_result.json`，其中包含整图结论、参考图选择、全部部件结论、证据路径和配置版本。标定模式写入 `calibration_observation.json`，其中只包含观察结果和证据路径。
+
+## 当前边界
+
+- 开发配置不是正式标定配置，不能用于现场生产判断。
+- 内部样本、证据图和派生报告只能留在授权本地或内网环境。
+- 当前不作异动准确率、召回率、漏检率或零漏检承诺；这些需要后续受控真实异动样本验证。
+- 现有模型文件不是设备身份识别模型，也不是通用缺陷分类模型。

@@ -1,4 +1,9 @@
-"""The public service boundary for one expected component comparison."""
+"""The public single-component comparison service.
+
+Daily detection requires a calibrated configuration.  Calibration callers use
+``observe`` instead, which returns measurements and evidence without exposing
+a normal/anomaly business conclusion.
+"""
 
 from __future__ import annotations
 
@@ -12,24 +17,21 @@ import numpy as np
 from .alignment import AlignmentDiagnostic, AlignmentResult, align
 from .artifacts import write_all_artifacts
 from .compare import CompareResult, compare_aligned
-from .config import load_config
+from .config import CalibratedConfig, default_config, load_config
+from .references import read_color_image
 from .result import (
     ArtifactSet,
+    CalibrationComponentObservation,
     ComparisonResult,
     ComparisonState,
     DetectionRegion,
     UnavailableReason,
 )
-from .roi import Roi, parse_roi_string, roi_to_pixel_rect
+from .roi import parse_roi_string, roi_to_pixel_rect
 
 
 class ImageComparisonService:
-    """Compare one caller-specified standard-image YOLO component ROI.
-
-    This service is deliberately the only high-level entry point.  It does
-    not infer an equipment identity: the expected component is the standard
-    image plus ROI supplied by the caller.
-    """
+    """Compare one caller-specified expected component."""
 
     def compare(
         self,
@@ -40,14 +42,75 @@ class ImageComparisonService:
         config_path: Optional[Path] = None,
         live_roi_str: Optional[str] = None,
     ) -> ComparisonResult:
-        """Run comparison and always return an explicit business state.
+        """Run daily detection for one component.
 
-        Input/setup faults raise exceptions.  A readable and valid image-pair
-        request that cannot be compared reliably instead returns
-        ``detection_unavailable`` with a reason and five evidence artifacts.
-        ``config_path=None`` is supported for local synthetic development only
-        and reports the development configuration version.
+        A valid, versioned configuration is mandatory.  This prevents a
+        caller from accidentally using development defaults to issue a normal
+        or anomaly business conclusion.
         """
+        if config_path is None:
+            raise ValueError(
+                "daily detection requires a valid versioned calibration configuration"
+            )
+        return self._compare_with_config(
+            standard_path=standard_path,
+            live_path=live_path,
+            roi=roi,
+            output_dir=output_dir,
+            config=load_config(Path(config_path), allow_development=False),
+            live_roi_str=live_roi_str,
+        )
+
+    def observe(
+        self,
+        standard_path: Path,
+        live_path: Path,
+        roi: str,
+        output_dir: Path,
+        processing_config_path: Optional[Path] = None,
+        component_index: int = 0,
+    ) -> CalibrationComponentObservation:
+        """Collect one component's calibration observations and evidence.
+
+        The returned object deliberately has no ``ComparisonState`` field.
+        A caller may inspect alignment metrics and difference candidates, but
+        must not mistake them for a normal or anomaly business conclusion.
+        """
+        parsed_roi = parse_roi_string(roi)
+        if parsed_roi is None:
+            raise ValueError(
+                f"invalid ROI string: {roi!r}; expected 'class_id center_x center_y width height'"
+            )
+        config = (load_config(Path(processing_config_path))
+                  if processing_config_path is not None else default_config())
+        result = self._compare_with_config(
+            standard_path=standard_path,
+            live_path=live_path,
+            roi=roi,
+            output_dir=output_dir,
+            config=config,
+        )
+        detail = result.unavailable_detail or "alignment and difference observations collected"
+        return CalibrationComponentObservation(
+            component_index=component_index,
+            category=parsed_roi.category,
+            alignment_metrics=result.alignment_metrics,
+            difference_candidate_count=len(result.detection_regions),
+            difference_regions=result.detection_regions,
+            observation_detail=detail,
+            artifacts=result.artifacts,
+        )
+
+    def _compare_with_config(
+        self,
+        standard_path: Path,
+        live_path: Path,
+        roi: str,
+        output_dir: Path,
+        config: CalibratedConfig,
+        live_roi_str: Optional[str] = None,
+    ) -> ComparisonResult:
+        """Perform the shared image-comparison work with an explicit config."""
         standard_path = Path(standard_path)
         live_path = Path(live_path)
         output_dir = Path(output_dir)
@@ -74,10 +137,8 @@ class ImageComparisonService:
         if not output_dir.is_dir():
             raise ValueError(f"output location is not a directory: {output_dir}")
 
-        config = load_config(Path(config_path) if config_path is not None else None)
-
-        standard = cv2.imread(str(standard_path), cv2.IMREAD_COLOR)
-        live = cv2.imread(str(live_path), cv2.IMREAD_COLOR)
+        standard = read_color_image(standard_path)
+        live = read_color_image(live_path)
         if standard is None:
             raise RuntimeError(f"cannot decode standard image: {standard_path}")
         if live is None:
@@ -97,9 +158,10 @@ class ImageComparisonService:
         alignment = align(standard_gray, live_gray, config)
         metrics = alignment.as_metrics_dict()
         standard_to_live = alignment.standard_to_live
-        projected_live_rect = _project_rect(
-            standard_rect, standard_to_live, live.shape[:2]
-        ) if standard_to_live is not None else supplied_live_rect
+        projected_live_rect = (
+            _project_rect(standard_rect, standard_to_live, live.shape[:2])
+            if standard_to_live is not None else supplied_live_rect
+        )
 
         if alignment.diagnostic != AlignmentDiagnostic.USABLE:
             detail = "; ".join(alignment.diagnostic_reasons) or "alignment quality is unavailable"
@@ -121,8 +183,6 @@ class ImageComparisonService:
             )
 
         if standard_to_live is None:
-            # Defensive guard: a usable diagnostic without the map would be a
-            # programming/configuration failure, never a normal conclusion.
             detail = "alignment reported usable without a standard-to-live map"
             artifacts = _write_unavailable_artifacts(
                 standard, live, alignment, projected_live_rect, output_dir, detail
@@ -205,12 +265,15 @@ class ImageComparisonService:
                 alignment_metrics=metrics,
                 config_version=config.version,
             )
+
         artifacts = _write_artifacts(
             standard, live, standard_to_live, alignment, comparison,
             projected_live_rect, live_regions, output_dir, "",
         )
-        state = (ComparisonState.CHANGE_DETECTED if live_regions
-                 else ComparisonState.NO_CHANGE_HIGH_CONFIDENCE)
+        state = (
+            ComparisonState.CHANGE_DETECTED
+            if live_regions else ComparisonState.NO_CHANGE_HIGH_CONFIDENCE
+        )
         return ComparisonResult(
             state=state,
             detection_regions=live_regions,
@@ -227,7 +290,7 @@ class ImageComparisonService:
         output_dir: Path,
         config_path: Optional[Path] = None,
     ) -> str:
-        """Run :meth:`compare` and serialize the public result to JSON."""
+        """Run daily detection and serialize the public result to JSON."""
         return _result_to_json(
             self.compare(standard_path, live_path, roi, output_dir, config_path)
         )
@@ -237,21 +300,22 @@ def _validate_pixel_rect(
     rect: tuple[int, int, int, int], image_width: int, image_height: int, name: str
 ) -> None:
     x, y, width, height = rect
-    if width <= 0 or height <= 0 or x < 0 or y < 0 or x + width > image_width or y + height > image_height:
+    if (width <= 0 or height <= 0 or x < 0 or y < 0
+            or x + width > image_width or y + height > image_height):
         raise ValueError(f"{name} does not contain at least one in-bounds pixel")
 
 
 def _project_rect(
-    rect: tuple[int, int, int, int], H: np.ndarray, live_shape: tuple[int, int]
+    rect: tuple[int, int, int, int], homography: np.ndarray, live_shape: tuple[int, int]
 ) -> Optional[tuple[int, int, int, int]]:
-    if H.shape != (3, 3) or not np.all(np.isfinite(H)):
+    if homography.shape != (3, 3) or not np.all(np.isfinite(homography)):
         return None
     x, y, width, height = rect
     corners = np.float32([
         [x, y], [x + width - 1, y],
         [x + width - 1, y + height - 1], [x, y + height - 1],
     ]).reshape(-1, 1, 2)
-    projected = cv2.perspectiveTransform(corners, H).reshape(-1, 2)
+    projected = cv2.perspectiveTransform(corners, homography).reshape(-1, 2)
     if not np.all(np.isfinite(projected)):
         return None
     live_height, live_width = live_shape
@@ -265,12 +329,14 @@ def _project_rect(
 
 
 def _map_regions_to_live(
-    standard_regions: list[DetectionRegion], H: np.ndarray, live_shape: tuple[int, int]
+    standard_regions: list[DetectionRegion],
+    homography: np.ndarray,
+    live_shape: tuple[int, int],
 ) -> Optional[list[DetectionRegion]]:
     regions: list[DetectionRegion] = []
     for region in standard_regions:
         projected = _project_rect(
-            (region.x, region.y, region.width, region.height), H, live_shape
+            (region.x, region.y, region.width, region.height), homography, live_shape
         )
         if projected is None:
             return None
@@ -287,9 +353,10 @@ def _map_regions_to_live(
 
 
 def _unavailable_reason(alignment: AlignmentResult) -> UnavailableReason:
-    if alignment.homography is None:
-        return UnavailableReason.MATCH_UNCERTAIN
-    return UnavailableReason.ALIGNMENT_FAILED
+    return (
+        UnavailableReason.MATCH_UNCERTAIN
+        if alignment.homography is None else UnavailableReason.ALIGNMENT_FAILED
+    )
 
 
 def _write_artifacts(
@@ -343,8 +410,9 @@ def _result_to_json(result: ComparisonResult) -> str:
     artifacts = result.artifacts
     obj = {
         "state": result.state.value,
-        "unavailable_reason": (result.unavailable_reason.value
-                                 if result.unavailable_reason else None),
+        "unavailable_reason": (
+            result.unavailable_reason.value if result.unavailable_reason else None
+        ),
         "unavailable_detail": result.unavailable_detail,
         "detection_regions": [
             {

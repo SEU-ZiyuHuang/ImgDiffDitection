@@ -17,8 +17,14 @@
 - 已完成内部正常样本的本地特征分析，用于了解图片、部件框和对齐质量的分布。
 - 已完成现有模型文件的来源、校验值、许可证、输入输出契约核查。
 - 已完成单部件 Python 比较模块：输入两张图片和一个部件框，输出结构化结果与完整证据图。
-- 单部件模块的 18 项合成自动测试已通过。
-- 下一步是增加标定模式、日常检测模式、多部件结论和整图汇总。
+- 当前 Python 模块的 24 项合成自动测试已通过。
+- 已完成标定模式、日常检测模式、多部件结论、整图汇总和多参考图选择；下一步是进一步强化可靠对齐和使用内部正常样本标定门槛。
+
+### 本地批量标定观察（仅汇总）
+
+已在授权本地环境对 `all_test` 运行标定模式：请求处理 385 个案例，完成 383 个案例，2 个案例因实时图无法解码而记录为失败；共生成 771 个部件观察结果。105 个案例包含多张参考图，其中 68 个最终选择了新增参考图。此处只公开汇总数字；图片、案例名称、文件路径、证据图和明细报告均不上传到仓库。
+
+这次运行只用于观察数据与验证流程，不输出“正常”或“异动”结论。几何对齐可用、有效区域充分，也不能单独证明标准图中的部件框已映射到实时图中的同一实际部件；该验证是后续可靠对齐工作的重点。
 
 ## 单部件模块
 
@@ -45,8 +51,8 @@
 需要 Python 3.12 或兼容版本。
 
 ```powershell
-python -m pip install -r .\imagecmp_py\requirements.txt
-python .\imagecmp_py\test_service.py
+python -m pip install -r .\imagecmp_py\requirements-dev.txt
+python -m pytest .\imagecmp_py\test_service.py -q
 ```
 
 使用一组图片进行单部件比较：
@@ -56,7 +62,7 @@ python .\imagecmp_py\cli.py compare `
   --standard .\test\temp.jpg `
   --live .\test\live.jpg `
   --roi "17 0.5 0.5 0.4 0.5" `
-  --config .\imagecmp_py\configs\development-default-v1.json `
+  --config .\path\to\calibrated-config.json `
   --output .\output\manual-check
 ```
 

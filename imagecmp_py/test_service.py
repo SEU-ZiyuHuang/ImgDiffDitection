@@ -30,10 +30,15 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from imagecmp import (
+    CalibrationObservation,
     ComparisonState,
+    ComponentConclusion,
     ImageComparisonService,
+    MultiComponentImageComparisonService,
+    ReferenceImage,
 )
-from imagecmp.roi import read_rois, parse_roi_string
+from imagecmp.references import discover_case_input
+from imagecmp.roi import Roi, read_rois, parse_roi_string
 from imagecmp.config import default_config
 
 
@@ -83,6 +88,22 @@ def _calibrated_config_payload(version: str) -> dict:
     return payload
 
 
+def _write_calibrated_config(directory: Path, version: str = "test-config-v1") -> Path:
+    path = directory / "calibration.json"
+    path.write_text(
+        json.dumps(_calibrated_config_payload(version)),
+        encoding="utf-8",
+    )
+    return path
+
+
+def _write_image(path: Path, image: np.ndarray) -> None:
+    """Write synthetic images through a Unicode-safe path API."""
+    success, encoded = cv2.imencode(path.suffix, image)
+    assert success, f"cannot encode {path}"
+    path.write_bytes(encoded.tobytes())
+
+
 # ---------------------------------------------------------------------------
 # Test cases
 # ---------------------------------------------------------------------------
@@ -99,6 +120,7 @@ def test_validate_missing_standard():
                 live_path=live_path,
                 roi="17 0.5 0.5 0.4 0.5",
                 output_dir=Path(tmp) / "out",
+                config_path=_write_calibrated_config(Path(tmp)),
             )
             assert False, "expected FileNotFoundError"
         except FileNotFoundError:
@@ -114,7 +136,10 @@ def test_validate_invalid_roi():
         cv2.imwrite(str(std), _create_textured_image())
         cv2.imwrite(str(live), _create_textured_image())
         try:
-            service.compare(std, live, roi="bad", output_dir=Path(tmp) / "out")
+            service.compare(
+                std, live, roi="bad", output_dir=Path(tmp) / "out",
+                config_path=_write_calibrated_config(Path(tmp)),
+            )
             assert False, "expected ValueError"
         except ValueError:
             pass
@@ -133,7 +158,8 @@ def test_validate_unwritable_output():
         blocker.write_text("x")
         try:
             service.compare(std, live, roi="17 0.5 0.5 0.4 0.5",
-                            output_dir=blocker / "sub")
+                            output_dir=blocker / "sub",
+                            config_path=_write_calibrated_config(Path(tmp)))
             assert False, "expected error"
         except (ValueError, OSError):
             pass
@@ -156,6 +182,7 @@ def test_no_change_identical():
             live_path=live_path,
             roi="17 0.5 0.5 0.4 0.5",
             output_dir=Path(tmp) / "out",
+            config_path=_write_calibrated_config(Path(tmp)),
         )
 
         assert result.state == ComparisonState.NO_CHANGE_HIGH_CONFIDENCE, (
@@ -167,7 +194,7 @@ def test_no_change_identical():
         assert result.artifacts.difference_mask.is_file()
         assert result.artifacts.difference_heatmap.is_file()
         assert result.artifacts.annotated_image.is_file()
-        assert result.config_version == "development-default-v1"
+        assert result.config_version == "test-config-v1"
 
 
 def test_change_detected_local_block():
@@ -187,6 +214,7 @@ def test_change_detected_local_block():
             live_path=live_path,
             roi="17 0.5 0.5 0.4 0.5",
             output_dir=Path(tmp) / "out",
+            config_path=_write_calibrated_config(Path(tmp)),
         )
 
         assert result.state == ComparisonState.CHANGE_DETECTED, (
@@ -217,6 +245,7 @@ def test_detection_unavailable_featureless():
             live_path=live_path,
             roi="17 0.5 0.5 0.4 0.5",
             output_dir=Path(tmp) / "out",
+            config_path=_write_calibrated_config(Path(tmp)),
         )
 
         assert result.state == ComparisonState.DETECTION_UNAVAILABLE, (
@@ -250,6 +279,7 @@ def test_variation_rotation():
             live_path=live_path,
             roi="17 0.5 0.5 0.4 0.5",
             output_dir=Path(tmp) / "out",
+            config_path=_write_calibrated_config(Path(tmp)),
         )
 
         # Should not be unavailable (rotation is within recovery range)
@@ -275,6 +305,7 @@ def test_variation_illumination():
             live_path=live_path,
             roi="17 0.5 0.5 0.4 0.5",
             output_dir=Path(tmp) / "out",
+            config_path=_write_calibrated_config(Path(tmp)),
         )
 
         # Illumination change alone should not raise CHANGE_DETECTED
@@ -342,10 +373,11 @@ def test_config_version_in_result():
             live_path=live_path,
             roi="17 0.5 0.5 0.4 0.5",
             output_dir=Path(tmp) / "out",
+            config_path=_write_calibrated_config(Path(tmp)),
         )
 
-        assert result.config_version == "development-default-v1", (
-            f"expected development-default-v1, got {result.config_version}"
+        assert result.config_version == "test-config-v1", (
+            f"expected test-config-v1, got {result.config_version}"
         )
 
 
@@ -367,6 +399,7 @@ def test_artifact_output_count():
             live_path=live_path,
             roi="17 0.5 0.5 0.4 0.5",
             output_dir=output_dir,
+            config_path=_write_calibrated_config(Path(tmp)),
         )
 
         assert result.artifacts is not None
@@ -394,6 +427,7 @@ def test_artifacts_support_unicode_output_directory():
             live_path,
             "17 0.5 0.5 0.4 0.5",
             tmp_path / "证据输出",
+            _write_calibrated_config(tmp_path),
         )
 
         assert result.artifacts is not None
@@ -423,6 +457,7 @@ def test_variation_blur():
             live_path=live_path,
             roi="17 0.5 0.5 0.4 0.5",
             output_dir=Path(tmp) / "out",
+            config_path=_write_calibrated_config(Path(tmp)),
         )
 
         # Blur may produce any state but should not crash
@@ -444,7 +479,8 @@ def test_detection_regions_use_live_image_coordinates():
         cv2.imwrite(str(standard_path), standard)
         cv2.imwrite(str(live_path), live)
         result = service.compare(
-            standard_path, live_path, "17 0.5 0.5 0.4 0.5", tmp_path / "out"
+            standard_path, live_path, "17 0.5 0.5 0.4 0.5", tmp_path / "out",
+            _write_calibrated_config(tmp_path),
         )
 
         assert result.state == ComparisonState.CHANGE_DETECTED
@@ -529,6 +565,162 @@ def test_invalid_config_is_an_error():
             pass
 
 
+def test_daily_detection_requires_config():
+    """Daily comparison may not use the development profile by omission."""
+    service = ImageComparisonService()
+    image = _create_textured_image()
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        standard_path = tmp_path / "standard.png"
+        live_path = tmp_path / "live.png"
+        _write_image(standard_path, image)
+        _write_image(live_path, image)
+        try:
+            service.compare(
+                standard_path, live_path, "17 0.5 0.5 0.4 0.5", tmp_path / "out"
+            )
+            assert False, "expected ValueError"
+        except ValueError as exc:
+            assert "requires" in str(exc)
+
+
+def test_daily_detection_rejects_development_configuration():
+    """Daily detection must not turn development defaults into a conclusion."""
+    service = ImageComparisonService()
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        standard_path = tmp_path / "standard.png"
+        live_path = tmp_path / "live.png"
+        image = _create_textured_image()
+        _write_image(standard_path, image)
+        _write_image(live_path, image)
+        development_config = (
+            Path(__file__).resolve().parent
+            / "configs"
+            / "development-default-v1.json"
+        )
+        try:
+            service.compare(
+                standard_path=standard_path,
+                live_path=live_path,
+                roi="17 0.5 0.5 0.4 0.5",
+                output_dir=tmp_path / "out",
+                config_path=development_config,
+            )
+        except ValueError as exc:
+            assert "development" in str(exc)
+        else:
+            raise AssertionError("daily detection must reject development configuration")
+
+
+def test_calibration_observation_has_no_business_state():
+    """Calibration reports observations and evidence, never normal/anomaly state."""
+    service = MultiComponentImageComparisonService()
+    image = _create_textured_image()
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        standard_path = tmp_path / "标准图.jpg"
+        live_path = tmp_path / "实时图.jpg"
+        _write_image(standard_path, image)
+        _write_image(live_path, image)
+        observation = service.calibrate(
+            live_path=live_path,
+            references=[ReferenceImage("primary", standard_path)],
+            rois=[Roi("17", 0.5, 0.5, 0.4, 0.5)],
+            output_dir=tmp_path / "标定输出",
+        )
+
+        assert isinstance(observation, CalibrationObservation)
+        assert not hasattr(observation, "state")
+        assert observation.component_observations[0].artifacts is not None
+        assert observation.manifest_path.is_file()
+
+
+def test_multi_reference_selects_trusted_reference_and_aggregates_components():
+    """A usable added reference wins over an unusable primary reference."""
+    service = MultiComponentImageComparisonService()
+    standard = _create_textured_image()
+    live = standard.copy()
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        unusable_reference = tmp_path / "primary.png"
+        usable_reference = tmp_path / "additional.png"
+        live_path = tmp_path / "live.png"
+        _write_image(unusable_reference, _featureless_image(320, 240))
+        _write_image(usable_reference, standard)
+        _write_image(live_path, live)
+
+        result = service.compare_daily(
+            live_path=live_path,
+            references=[
+                ReferenceImage("primary", unusable_reference),
+                ReferenceImage("additional_0", usable_reference),
+            ],
+            rois=[
+                Roi("left", 0.25, 0.5, 0.5, 1.0),
+                Roi("right", 0.75, 0.5, 0.5, 1.0),
+            ],
+            output_dir=tmp_path / "daily-output",
+            config_path=_write_calibrated_config(tmp_path),
+        )
+
+        assert result.selected_reference_id == "additional_0"
+        assert result.state == ComparisonState.NO_CHANGE_HIGH_CONFIDENCE
+        assert len(result.component_conclusions) == 2
+        assert all(
+            conclusion.state == ComparisonState.NO_CHANGE_HIGH_CONFIDENCE
+            for conclusion in result.component_conclusions
+        )
+        assert result.manifest_path.is_file()
+        assert result.reference_attempts[1].selected
+
+
+def test_aggregate_never_turns_change_or_unavailable_into_normal():
+    """Image-level normal is legal only when every component is normal."""
+    normal = ComponentConclusion(
+        component_index=0,
+        category="normal",
+        state=ComparisonState.NO_CHANGE_HIGH_CONFIDENCE,
+    )
+    changed = ComponentConclusion(
+        component_index=1,
+        category="changed",
+        state=ComparisonState.CHANGE_DETECTED,
+    )
+    unavailable = ComponentConclusion(
+        component_index=1,
+        category="unavailable",
+        state=ComparisonState.DETECTION_UNAVAILABLE,
+    )
+    from imagecmp import aggregate_component_conclusions
+
+    assert aggregate_component_conclusions([normal, changed]) == ComparisonState.CHANGE_DETECTED
+    assert (aggregate_component_conclusions([normal, unavailable])
+            == ComparisonState.DETECTION_UNAVAILABLE)
+    assert (aggregate_component_conclusions([normal])
+            == ComparisonState.NO_CHANGE_HIGH_CONFIDENCE)
+
+
+def test_case_discovery_collects_all_reference_images():
+    """Case discovery recognises the primary and ordered additional references."""
+    image = _create_textured_image()
+    with tempfile.TemporaryDirectory() as tmp:
+        case_directory = Path(tmp) / "样本案例"
+        case_directory.mkdir()
+        _write_image(case_directory / "对比截图.jpg", image)
+        _write_image(case_directory / "标准源图.jpg", image)
+        _write_image(case_directory / "新增标准源图0.jpg", image)
+        _write_image(case_directory / "新增标准源图1.jpg", image)
+        (case_directory / "标准源图坐标.txt").write_text(
+            "17 0.5 0.5 0.4 0.5\n", encoding="utf-8"
+        )
+
+        case = discover_case_input(case_directory)
+        assert [reference.reference_id for reference in case.references] == [
+            "primary", "additional_0", "additional_1",
+        ]
+
+
 # ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
@@ -556,6 +748,15 @@ def _run_tests() -> int:
          test_unreliable_alignment_is_unavailable_with_artifacts),
         ("explicit_missing_config_is_an_error", test_explicit_missing_config_is_an_error),
         ("invalid_config_is_an_error", test_invalid_config_is_an_error),
+        ("daily_detection_requires_config", test_daily_detection_requires_config),
+        ("calibration_observation_has_no_business_state",
+         test_calibration_observation_has_no_business_state),
+        ("multi_reference_selects_trusted_reference_and_aggregates_components",
+         test_multi_reference_selects_trusted_reference_and_aggregates_components),
+        ("aggregate_never_turns_change_or_unavailable_into_normal",
+         test_aggregate_never_turns_change_or_unavailable_into_normal),
+        ("case_discovery_collects_all_reference_images",
+         test_case_discovery_collects_all_reference_images),
     ]
 
     passed = 0

@@ -65,6 +65,12 @@ def read_rois(path: Path) -> RoiResult:
 
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
+    except UnicodeDecodeError:
+        try:
+            lines = path.read_text(encoding="gb18030").splitlines()
+        except OSError as exc:
+            result.errors.append(f"cannot read ROI file: {exc}")
+            return result
     except OSError as exc:
         result.errors.append(f"cannot read ROI file: {exc}")
         return result

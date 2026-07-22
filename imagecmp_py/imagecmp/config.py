@@ -201,13 +201,17 @@ def _parse_detection(raw: Any) -> DetectionThresholds:
     return parsed
 
 
-def load_config(path: Optional[Path]) -> CalibratedConfig:
+def load_config(
+    path: Optional[Path], *, allow_development: bool = True
+) -> CalibratedConfig:
     """Load and validate a configuration.
 
-    ``None`` selects a clearly-labelled development configuration so local
-    synthetic tests remain runnable.  A path that was explicitly supplied
-    must exist and be valid; silently falling back would hide deployment
-    mistakes as detection outcomes.
+    ``None`` selects a clearly-labelled development configuration for
+    calibration observations and local synthetic tests.  Daily detection
+    passes ``allow_development=False`` so it cannot publish a business result
+    from that profile.  A path that was explicitly supplied must exist and be
+    valid; silently falling back would hide deployment mistakes as detection
+    outcomes.
     """
     if path is None:
         print(
@@ -236,11 +240,17 @@ def load_config(path: Optional[Path]) -> CalibratedConfig:
     if not isinstance(version, str) or not version.strip():
         raise ValueError("configuration version must be a non-empty string")
 
-    return CalibratedConfig(
+    config = CalibratedConfig(
         version=version.strip(),
         alignment=_parse_alignment(raw.get("alignment")),
         detection=_parse_detection(raw.get("detection")),
     )
+    if not allow_development and config.version == _DEVELOPMENT_CONFIG_VERSION:
+        raise ValueError(
+            "development configuration cannot be used for daily detection; "
+            "supply a versioned configuration produced by calibration"
+        )
+    return config
 
 
 def default_config() -> CalibratedConfig:
