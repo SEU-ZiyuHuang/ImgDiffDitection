@@ -94,6 +94,7 @@ def _region_json(region) -> dict:
         "height": region.height,
         "confidence": region.confidence,
         "evidence_channels": region.evidence_channels,
+        "decision_eligible": region.decision_eligible,
     }
 
 

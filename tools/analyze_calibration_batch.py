@@ -40,9 +40,21 @@ ALIGNMENT_METRIC_KEYS = (
     "roi_valid_overlap_ratio",
     "appearance_ncc",
     "appearance_ssim",
+    "appearance_histogram_ncc",
+    "appearance_local_contrast_ncc",
+    "appearance_gradient_ncc",
     "effective_resolution_scale",
     "effective_live_width_pixels",
     "effective_live_height_pixels",
+    "illumination_luma_median_shift",
+    "colour_weight",
+    "standard_laplacian_sharpness",
+    "live_laplacian_sharpness",
+    "sharpness_ratio",
+    "comparison_quality_usable",
+    "raw_candidate_count",
+    "decision_candidate_count",
+    "small_candidate_count",
 )
 
 # Fixed comparison point from the pre-#6 local calibration run.  This is a
@@ -142,6 +154,7 @@ def _alignment_distributions(records: Iterable[dict[str, Any]]) -> dict[str, dic
 
 
 def _is_near_identity(row: dict[str, Any]) -> bool:
+    """CSV-reconstructable geometry proxy, not the historical 29-case label."""
     center = _finite_number(row.get("center_displacement_relative_diagonal"))
     area_ratio = _finite_number(row.get("projected_area_ratio"))
     return bool(
@@ -224,6 +237,7 @@ def _write_markdown(path: Path, report: dict[str, Any]) -> None:
     components = report["components"]
     candidates = report["difference_candidates"]
     evidence = report["evidence"]
+    mapping = report["mapping_evidence"]
     false_usable = report["alignment"]["suspect_false_usable_signature"]
     lines = [
         "# 标定批次详细分析",
@@ -250,20 +264,32 @@ def _write_markdown(path: Path, report: dict[str, Any]) -> None:
         "",
         "## 远近景/父子视图伪可用签名",
         "",
-        "- 签名：近似恒等单应、空间覆盖度 < 0.20、ECC 未收敛。",
+        "- 运行时代理签名：近似恒等几何、空间覆盖度 < 0.20、ECC 未收敛；它不能精确复原历史 29 个标签。",
         f"- 当前批次：{false_usable['current_suspect_components']} / "
         f"{false_usable['current_usable_components']} 个全图 usable 部件，"
         f"比例 {format(false_usable['current_rate'], '.2%') if false_usable['current_rate'] is not None else '无可比较分母'}。",
-        f"- 2026-07-22 基线：{false_usable['baseline_suspect_components']} / "
+        f"- 2026-07-22 已发布历史基线：{false_usable['baseline_suspect_components']} / "
         f"{false_usable['baseline_usable_components']}，"
-        f"比例 {false_usable['baseline_rate']:.2%}。",
-        f"- 新链路观察到该签名 {false_usable['all_signature_components']} 个；其中仍被标为 usable 的数量才计入当前伪可用率。",
+        f"比例 {false_usable['baseline_rate']:.2%}；其原始 H 判定细节未保存在汇总 CSV 中。",
+        f"- 当前批次 ECC 未收敛共 {false_usable['all_ecc_not_converged_components']} 个；"
+        f"其中仍被标为 usable 的数量为 {false_usable['usable_ecc_not_converged_components']}。",
+        f"- 新链路观察到运行时代理签名 {false_usable['all_signature_components']} 个；其中仍被标为 usable 的数量才计入当前代理率。",
         "",
         "## 部件与差异候选",
         "",
         f"- 已观察部件：{components['observed_components']}；存在差异候选的部件：{components['components_with_candidates']}。",
         f"- 差异候选区域总数：{candidates['regions']}；候选区域面积统计见 JSON 和 CSV 明细。",
         f"- 完整证据部件：{evidence['complete_components']}；证据不完整部件：{evidence['incomplete_components']}。",
+        "",
+        "## 可信比较路径",
+        "",
+        f"- 全图配准可用的部件：{mapping['global_alignment_usable_components']}；"
+        f"全图配准不可靠或不可用的部件：{mapping['global_alignment_not_usable_components']}。",
+        f"- 在全图配准可用的前提下，部件映射通过：{mapping['mapping_passed_after_global_gate']}；"
+        f"映射证据不足：{mapping['mapping_rejected_after_global_gate']}。",
+        f"- 已通过三次抗光照复核、会在日常检测中走“图像不匹配异动”分支的部件："
+        f"{mapping['confirmed_image_mismatch_after_global_gate']}。",
+        "- 这些是标定观察对运行路径的统计，不是对 all_test 的正常或异动标注。",
         "",
         "## 失败案例",
         "",
@@ -433,6 +459,7 @@ def analyze(batch_output: Path) -> tuple[dict[str, Any], list[dict[str, Any]], l
                     "area_pixels": width * height if width is not None and height is not None else None,
                     "confidence": region.get("confidence"),
                     "evidence_channels": region.get("evidence_channels", []),
+                    "decision_eligible": bool(region.get("decision_eligible", False)),
                 })
         case_rows.append(base_row)
 
@@ -472,10 +499,33 @@ def analyze(batch_output: Path) -> tuple[dict[str, Any], list[dict[str, Any]], l
     remaining_false_usable = [
         row for row in usable_components if _is_suspect_false_usable_signature(row)
     ]
+    all_ecc_not_converged = [
+        row for row in component_rows
+        if _finite_number(row.get("ecc_converged")) == 0.0
+    ]
+    usable_ecc_not_converged = [
+        row for row in usable_components
+        if _finite_number(row.get("ecc_converged")) == 0.0
+    ]
     baseline_rate = _rate(
         SUSPECT_FALSE_USABLE_BASELINE["suspect_components"],
         SUSPECT_FALSE_USABLE_BASELINE["usable_components"],
     )
+    global_alignment_usable = [
+        row for row in component_rows if row.get("diagnostic") == "usable"
+    ]
+    mapping_passed_after_global_gate = [
+        row for row in global_alignment_usable
+        if _finite_number(row.get("component_mapping_usable")) == 1.0
+    ]
+    mapping_rejected_after_global_gate = [
+        row for row in global_alignment_usable
+        if _finite_number(row.get("component_mapping_usable")) == 0.0
+    ]
+    confirmed_image_mismatch_after_global_gate = [
+        row for row in global_alignment_usable
+        if _finite_number(row.get("appearance_mismatch_confirmed")) == 1.0
+    ]
 
     report = {
         "report_kind": "calibration_observation_analysis",
@@ -506,17 +556,24 @@ def analyze(batch_output: Path) -> tuple[dict[str, Any], list[dict[str, Any]], l
             "component_metrics": _alignment_distributions(component_rows),
             "suspect_false_usable_signature": {
                 "definition": (
-                    "near-identity homography, spatial_coverage < 0.20, "
-                    "and ecc_converged == 0"
+                    "CSV-reconstructable runtime proxy: near-identity geometry "
+                    "(center displacement <= 0.05 diagonal and area ratio within 0.15), "
+                    "spatial_coverage < 0.20, and ecc_converged == 0"
                 ),
                 "baseline_date": SUSPECT_FALSE_USABLE_BASELINE["date"],
                 "baseline_suspect_components": SUSPECT_FALSE_USABLE_BASELINE["suspect_components"],
                 "baseline_usable_components": SUSPECT_FALSE_USABLE_BASELINE["usable_components"],
                 "baseline_rate": baseline_rate,
+                "historical_baseline_note": (
+                    "The published 29-case baseline used complete historical alignment "
+                    "evidence; exact membership cannot be reconstructed from aggregate CSV."
+                ),
                 "all_signature_components": len(signature_components),
                 "current_suspect_components": len(remaining_false_usable),
                 "current_usable_components": len(usable_components),
                 "current_rate": _rate(len(remaining_false_usable), len(usable_components)),
+                "all_ecc_not_converged_components": len(all_ecc_not_converged),
+                "usable_ecc_not_converged_components": len(usable_ecc_not_converged),
             },
         },
         "components": {
@@ -535,8 +592,25 @@ def analyze(batch_output: Path) -> tuple[dict[str, Any], list[dict[str, Any]], l
                 name: group_summary(rows) for name, rows in sorted(type_components.items())
             },
         },
+        "mapping_evidence": {
+            "global_alignment_usable_components": len(global_alignment_usable),
+            "global_alignment_not_usable_components": (
+                len(component_rows) - len(global_alignment_usable)
+            ),
+            "mapping_passed_after_global_gate": len(mapping_passed_after_global_gate),
+            "mapping_rejected_after_global_gate": len(mapping_rejected_after_global_gate),
+            "confirmed_image_mismatch_after_global_gate": len(
+                confirmed_image_mismatch_after_global_gate
+            ),
+        },
         "difference_candidates": {
             "regions": len(region_rows),
+            "decision_eligible_regions": sum(
+                bool(row.get("decision_eligible")) for row in region_rows
+            ),
+            "raw_only_regions": sum(
+                not bool(row.get("decision_eligible")) for row in region_rows
+            ),
             "region_area_pixels": _distribution(row.get("area_pixels") for row in region_rows),
             "region_confidence": _distribution(row.get("confidence") for row in region_rows),
             "evidence_channels": dict(candidate_channels),

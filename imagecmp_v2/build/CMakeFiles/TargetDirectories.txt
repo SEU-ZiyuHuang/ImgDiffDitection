@@ -1,4 +1,0 @@
-/opt/work/nfs95/imagecmp_v2/build/CMakeFiles/lximagecmp.dir
-/opt/work/nfs95/imagecmp_v2/build/CMakeFiles/test.dir
-/opt/work/nfs95/imagecmp_v2/build/CMakeFiles/edit_cache.dir
-/opt/work/nfs95/imagecmp_v2/build/CMakeFiles/rebuild_cache.dir

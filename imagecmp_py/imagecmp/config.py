@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 import sys
 from dataclasses import dataclass, field, fields
 from pathlib import Path
@@ -16,6 +17,9 @@ from typing import Any, Optional
 
 
 _DEVELOPMENT_CONFIG_VERSION = "development-default-v1"
+_SUPERPOINT_LIGHTGLUE_SHA256 = (
+    "228994cea8c010146fa2aef933baa3ffaa4bcdc522bc8aa560087fcff8134526"
+)
 
 
 @dataclass(frozen=True)
@@ -53,6 +57,16 @@ class AlignmentThresholds:
     effective_component_width_min_pixels: int = 24
     effective_component_height_min_pixels: int = 24
 
+    # Issue 8.0: this is deliberately opt-in while deployment approval for
+    # the model dependency is pending.  It may only supply correspondence
+    # points; the normal geometric and ECC gates still decide ``usable``.
+    superpoint_lightglue_fallback_enabled: bool = False
+    superpoint_lightglue_model_path: str = "superpoint_lightglue_pipeline.onnx"
+    superpoint_lightglue_model_sha256: str = _SUPERPOINT_LIGHTGLUE_SHA256
+    superpoint_lightglue_match_score_min: float = 0.50
+    superpoint_lightglue_input_width: int = 512
+    superpoint_lightglue_input_height: int = 512
+
 
 @dataclass(frozen=True)
 class DetectionThresholds:
@@ -64,6 +78,17 @@ class DetectionThresholds:
     morphology_kernel_size: int = 1
     min_detection_area_pixels: int = 100
     min_detection_confidence: float = 0.30
+
+    # Issue 8: illumination handling and area-aware candidate confidence.
+    illumination_normalization_enabled: bool = True
+    illumination_luma_shift_full_weight: float = 24.0
+    illumination_color_weight_floor: float = 0.20
+    local_illumination_kernel_size: int = 15
+    local_structure_gradient_threshold: float = 0.60
+    image_quality_blur_gate_enabled: bool = True
+    image_quality_sharpness_ratio_min: float = 0.30
+    candidate_area_confidence_reference_pixels: int = 100
+    candidate_area_confidence_floor: float = 0.15
 
 
 @dataclass(frozen=True)
@@ -89,6 +114,18 @@ def _positive_int(value: Any, name: str, minimum: int = 1) -> int:
     if not numeric.is_integer() or numeric < minimum:
         raise ValueError(f"configuration field {name!r} must be an integer >= {minimum}")
     return int(numeric)
+
+
+def _boolean(value: Any, name: str) -> bool:
+    if not isinstance(value, bool):
+        raise ValueError(f"configuration field {name!r} must be a boolean")
+    return value
+
+
+def _non_empty_string(value: Any, name: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"configuration field {name!r} must be a non-empty string")
+    return value.strip()
 
 
 def _merge_dataclass(raw: Any, defaults: Any, section: str) -> dict[str, Any]:
@@ -181,6 +218,32 @@ def _parse_alignment(raw: Any) -> AlignmentThresholds:
             values["effective_component_height_min_pixels"],
             "alignment.effective_component_height_min_pixels",
         ),
+        superpoint_lightglue_fallback_enabled=_boolean(
+            values["superpoint_lightglue_fallback_enabled"],
+            "alignment.superpoint_lightglue_fallback_enabled",
+        ),
+        superpoint_lightglue_model_path=_non_empty_string(
+            values["superpoint_lightglue_model_path"],
+            "alignment.superpoint_lightglue_model_path",
+        ),
+        superpoint_lightglue_model_sha256=_non_empty_string(
+            values["superpoint_lightglue_model_sha256"],
+            "alignment.superpoint_lightglue_model_sha256",
+        ).lower(),
+        superpoint_lightglue_match_score_min=_finite_number(
+            values["superpoint_lightglue_match_score_min"],
+            "alignment.superpoint_lightglue_match_score_min",
+        ),
+        superpoint_lightglue_input_width=_positive_int(
+            values["superpoint_lightglue_input_width"],
+            "alignment.superpoint_lightglue_input_width",
+            32,
+        ),
+        superpoint_lightglue_input_height=_positive_int(
+            values["superpoint_lightglue_input_height"],
+            "alignment.superpoint_lightglue_input_height",
+            32,
+        ),
     )
 
     if not 0.0 < parsed.match_ratio_test_max <= 1.0:
@@ -220,6 +283,10 @@ def _parse_alignment(raw: Any) -> AlignmentThresholds:
         raise ValueError("alignment.appearance_ssim_min must be in [-1, 1]")
     if not 0.0 < parsed.effective_resolution_scale_min <= 1.0:
         raise ValueError("alignment.effective_resolution_scale_min must be in (0, 1]")
+    if not re.fullmatch(r"[0-9a-f]{64}", parsed.superpoint_lightglue_model_sha256):
+        raise ValueError("alignment.superpoint_lightglue_model_sha256 must be a SHA-256 hex digest")
+    if not 0.0 <= parsed.superpoint_lightglue_match_score_min <= 1.0:
+        raise ValueError("alignment.superpoint_lightglue_match_score_min must be in [0, 1]")
     return parsed
 
 
@@ -246,6 +313,42 @@ def _parse_detection(raw: Any) -> DetectionThresholds:
         min_detection_confidence=_finite_number(
             values["min_detection_confidence"], "detection.min_detection_confidence"
         ),
+        illumination_normalization_enabled=_boolean(
+            values["illumination_normalization_enabled"],
+            "detection.illumination_normalization_enabled",
+        ),
+        illumination_luma_shift_full_weight=_finite_number(
+            values["illumination_luma_shift_full_weight"],
+            "detection.illumination_luma_shift_full_weight",
+        ),
+        illumination_color_weight_floor=_finite_number(
+            values["illumination_color_weight_floor"],
+            "detection.illumination_color_weight_floor",
+        ),
+        local_illumination_kernel_size=_positive_int(
+            values["local_illumination_kernel_size"],
+            "detection.local_illumination_kernel_size",
+        ),
+        local_structure_gradient_threshold=_finite_number(
+            values["local_structure_gradient_threshold"],
+            "detection.local_structure_gradient_threshold",
+        ),
+        image_quality_blur_gate_enabled=_boolean(
+            values["image_quality_blur_gate_enabled"],
+            "detection.image_quality_blur_gate_enabled",
+        ),
+        image_quality_sharpness_ratio_min=_finite_number(
+            values["image_quality_sharpness_ratio_min"],
+            "detection.image_quality_sharpness_ratio_min",
+        ),
+        candidate_area_confidence_reference_pixels=_positive_int(
+            values["candidate_area_confidence_reference_pixels"],
+            "detection.candidate_area_confidence_reference_pixels",
+        ),
+        candidate_area_confidence_floor=_finite_number(
+            values["candidate_area_confidence_floor"],
+            "detection.candidate_area_confidence_floor",
+        ),
     )
     if parsed.lab_delta_e_threshold <= 0.0:
         raise ValueError("detection.lab_delta_e_threshold must be > 0")
@@ -257,6 +360,21 @@ def _parse_detection(raw: Any) -> DetectionThresholds:
         raise ValueError("detection.morphology_kernel_size must be odd")
     if not 0.0 <= parsed.min_detection_confidence <= 1.0:
         raise ValueError("detection.min_detection_confidence must be in [0, 1]")
+    if parsed.illumination_luma_shift_full_weight <= 0.0:
+        raise ValueError("detection.illumination_luma_shift_full_weight must be > 0")
+    if not 0.0 <= parsed.illumination_color_weight_floor <= 1.0:
+        raise ValueError("detection.illumination_color_weight_floor must be in [0, 1]")
+    if (parsed.local_illumination_kernel_size < 3
+            or parsed.local_illumination_kernel_size % 2 != 1):
+        raise ValueError("detection.local_illumination_kernel_size must be odd and >= 3")
+    if parsed.local_structure_gradient_threshold <= 0.0:
+        raise ValueError("detection.local_structure_gradient_threshold must be > 0")
+    if not 0.0 < parsed.image_quality_sharpness_ratio_min <= 1.0:
+        raise ValueError(
+            "detection.image_quality_sharpness_ratio_min must be in (0, 1]"
+        )
+    if not 0.0 <= parsed.candidate_area_confidence_floor <= 1.0:
+        raise ValueError("detection.candidate_area_confidence_floor must be in [0, 1]")
     return parsed
 
 

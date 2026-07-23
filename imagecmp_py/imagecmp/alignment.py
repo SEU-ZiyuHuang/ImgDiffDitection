@@ -9,7 +9,9 @@ All thresholds come from the loaded CalibratedConfig, not hard-coded constants.
 
 from __future__ import annotations
 
+import hashlib
 import math
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
@@ -18,11 +20,25 @@ import cv2
 import numpy as np
 
 from .config import CalibratedConfig
+from .superpoint_lightglue import CorrespondenceEvidence, match_global_correspondences
 
 # ---------------------------------------------------------------------------
 # Sentinel for unavailable numeric fields
 # ---------------------------------------------------------------------------
 _NAN = float("nan")
+_ALIGNMENT_CACHE_LIMIT = 12
+_ALIGNMENT_CACHE: OrderedDict[tuple, AlignmentResult] = OrderedDict()
+
+
+def clear_alignment_cache() -> None:
+    """Drop process-local pair results at a public workflow boundary.
+
+    One multi-component case intentionally reuses its global alignment, while
+    an independent service instance must not inherit a previous caller's
+    diagnostic record.  This also keeps a transient ECC failure from being
+    hidden by an earlier cache hit.
+    """
+    _ALIGNMENT_CACHE.clear()
 
 
 class AlignmentDiagnostic(Enum):
@@ -82,6 +98,16 @@ class AlignmentResult:
     diagnostic_reasons: list[str] = field(default_factory=list)
     stage_diagnostics: list[str] = field(default_factory=list)
 
+    # Correspondence provenance is evidence, not a new client-facing result.
+    correspondence_method: str = "orb"
+    alignment_fallback_attempted: bool = False
+    alignment_primary_diagnostic: str = ""
+    alignment_primary_feature_match_count: int = 0
+    alignment_fallback_diagnostic: str = ""
+    alignment_fallback_feature_match_count: int = 0
+    alignment_fallback_elapsed_ms: float = _NAN
+    alignment_fallback_detail: str = ""
+
     def as_metrics_dict(self) -> dict:
         """Return observed alignment evidence as a flat dict.
 
@@ -107,11 +133,20 @@ class AlignmentResult:
             ("near_identity_transform", 1 if self.near_identity_transform else 0),
             ("suspected_zoom_parent_child_mismatch", 1 if self.suspected_zoom_parent_child_mismatch else 0),
             ("diagnostic", self.diagnostic.value),
+            ("alignment_correspondence_method", self.correspondence_method),
+            ("alignment_fallback_attempted", 1 if self.alignment_fallback_attempted else 0),
+            ("alignment_primary_diagnostic", self.alignment_primary_diagnostic),
+            ("alignment_primary_feature_match_count", self.alignment_primary_feature_match_count),
+            ("alignment_fallback_diagnostic", self.alignment_fallback_diagnostic),
+            ("alignment_fallback_feature_match_count", self.alignment_fallback_feature_match_count),
+            ("alignment_fallback_elapsed_ms", self.alignment_fallback_elapsed_ms),
         ]
         metrics = {k: v for k, v in fields if isinstance(v, (int, str)) or math.isfinite(v)}
         metrics["alignment_stages"] = list(self.stage_diagnostics)
         if self.ecc_failure_detail:
             metrics["ecc_failure_detail"] = self.ecc_failure_detail
+        if self.alignment_fallback_detail:
+            metrics["alignment_fallback_detail"] = self.alignment_fallback_detail
         if self.diagnostic_reasons:
             metrics["alignment_diagnostic_reasons"] = list(self.diagnostic_reasons)
         return metrics
@@ -142,7 +177,7 @@ def _median(values: list[float]) -> float:
 # Main alignment entry point
 # ---------------------------------------------------------------------------
 
-def align(
+def _align_orb(
     standard_gray: np.ndarray,
     live_gray: np.ndarray,
     config: CalibratedConfig,
@@ -160,7 +195,7 @@ def align(
         coordinates via H_inv.  result.valid_mask marks pixels that came
         from the live image (not border fill).
     """
-    result = AlignmentResult()
+    result = AlignmentResult(correspondence_method="orb")
     th = config.alignment
 
     # ----- 1. ORB feature extraction ---------------------------------------
@@ -328,6 +363,214 @@ def align(
     # ----- 8. Diagnostic classification ------------------------------------
     _classify_diagnostic(result, th)
     return result
+
+
+def align(
+    standard_gray: np.ndarray,
+    live_gray: np.ndarray,
+    config: CalibratedConfig,
+) -> AlignmentResult:
+    """Align with ORB first, then optionally retry the same gates with SP+LG.
+
+    The fallback is intentionally inside this module's interface.  Callers
+    receive one alignment result and never decide trust from a model score or
+    a model-specific rectangle.
+    """
+    cache_key = _alignment_cache_key(standard_gray, live_gray, config)
+    cached = _ALIGNMENT_CACHE.get(cache_key)
+    if cached is not None:
+        _ALIGNMENT_CACHE.move_to_end(cache_key)
+        return cached
+
+    primary = _align_orb(standard_gray, live_gray, config)
+    if (primary.diagnostic == AlignmentDiagnostic.USABLE
+            or not config.alignment.superpoint_lightglue_fallback_enabled):
+        return _cache_alignment(cache_key, primary)
+
+    evidence = match_global_correspondences(
+        standard_gray, live_gray, config.alignment
+    )
+    fallback = _align_superpoint_lightglue(
+        standard_gray, live_gray, config, evidence
+    )
+    _record_fallback_attempt(fallback, primary, evidence)
+    if fallback.diagnostic == AlignmentDiagnostic.USABLE:
+        return _cache_alignment(cache_key, fallback)
+
+    # A failed fallback is diagnostic evidence only.  Preserve the ORB map
+    # when it exists so unavailable artifacts remain as informative as before.
+    _record_fallback_attempt(primary, primary, evidence, fallback)
+    return _cache_alignment(cache_key, primary)
+
+
+def _alignment_cache_key(
+    standard_gray: np.ndarray, live_gray: np.ndarray, config: CalibratedConfig
+) -> tuple:
+    """Cache one reference/live alignment across all component ROIs in a case."""
+    digest = hashlib.blake2b(digest_size=16)
+    for image in (standard_gray, live_gray):
+        contiguous = np.ascontiguousarray(image)
+        digest.update(str(contiguous.shape).encode("ascii"))
+        digest.update(contiguous.dtype.str.encode("ascii"))
+        digest.update(contiguous.data)
+    return (digest.digest(), config.alignment)
+
+
+def _cache_alignment(key: tuple, result: AlignmentResult) -> AlignmentResult:
+    _ALIGNMENT_CACHE[key] = result
+    _ALIGNMENT_CACHE.move_to_end(key)
+    while len(_ALIGNMENT_CACHE) > _ALIGNMENT_CACHE_LIMIT:
+        _ALIGNMENT_CACHE.popitem(last=False)
+    return result
+
+
+def _record_fallback_attempt(
+    result: AlignmentResult,
+    primary: AlignmentResult,
+    evidence: CorrespondenceEvidence,
+    fallback: Optional[AlignmentResult] = None,
+) -> None:
+    result.alignment_fallback_attempted = True
+    result.alignment_primary_diagnostic = primary.diagnostic.value
+    result.alignment_primary_feature_match_count = primary.feature_match_count
+    result.alignment_fallback_feature_match_count = evidence.accepted_match_count
+    result.alignment_fallback_elapsed_ms = evidence.elapsed_ms
+    result.alignment_fallback_detail = evidence.detail
+    result.alignment_fallback_diagnostic = (
+        fallback.diagnostic.value if fallback is not None else result.diagnostic.value
+    )
+
+
+def _align_superpoint_lightglue(
+    standard_gray: np.ndarray,
+    live_gray: np.ndarray,
+    config: CalibratedConfig,
+    evidence: CorrespondenceEvidence,
+) -> AlignmentResult:
+    """Apply the existing geometry/ECC chain to neural correspondence points."""
+    result = AlignmentResult(correspondence_method="superpoint_lightglue")
+    result.stage_diagnostics.append("feature_correspondence_superpoint_lightglue")
+    result.standard_keypoints = evidence.standard_keypoints
+    result.live_keypoints = evidence.live_keypoints
+    result.feature_match_count = evidence.accepted_match_count
+    if evidence.detail:
+        result.diagnostic_reasons.append(evidence.detail)
+        return result
+    if evidence.accepted_match_count < 4:
+        result.diagnostic_reasons.append(
+            f"insufficient SuperPoint+LightGlue matches for homography ({evidence.accepted_match_count} < 4)"
+        )
+        return result
+
+    th = config.alignment
+    src_pts = evidence.standard_points.reshape(-1, 1, 2).astype(np.float32)
+    dst_pts = evidence.live_points.reshape(-1, 1, 2).astype(np.float32)
+    H, inlier_mask = cv2.findHomography(
+        src_pts, dst_pts, cv2.RANSAC, th.ransac_reprojection_threshold_pixels
+    )
+    if H is None or H.size == 0 or inlier_mask is None:
+        result.diagnostic_reasons.append("SuperPoint+LightGlue homography estimation returned empty")
+        return result
+
+    H = H.astype(np.float64)
+    result.homography = H
+    result.standard_to_live = H.copy()
+    inlier_src = src_pts[inlier_mask.ravel() == 1]
+    inlier_dst = dst_pts[inlier_mask.ravel() == 1]
+    result.inlier_count = len(inlier_src)
+    result.inlier_rate = result.inlier_count / result.feature_match_count
+    result.inlier_standard_points = inlier_src.reshape(-1, 2).copy()
+    result.inlier_live_points = inlier_dst.reshape(-1, 2).copy()
+
+    if len(inlier_src) > 0:
+        projected_inliers = cv2.perspectiveTransform(
+            inlier_src.reshape(-1, 1, 2), H
+        ).reshape(-1, 2)
+        errors = np.linalg.norm(projected_inliers - inlier_dst.reshape(-1, 2), axis=1)
+        result.reprojection_error_pixels = float(np.mean(errors))
+        if len(inlier_src) >= 3:
+            hull = cv2.convexHull(inlier_src.reshape(-1, 2).astype(np.float32))
+            result.spatial_coverage = cv2.contourArea(hull) / (
+                standard_gray.shape[1] * standard_gray.shape[0]
+            )
+
+    _compute_projected_geometry(result, standard_gray, live_gray)
+    if not result.projected_geometry_valid:
+        result.diagnostic_reasons.append("projected geometry is degenerate")
+        return result
+    if not _complete_valid_overlap_and_ecc(result, standard_gray, live_gray, th):
+        return result
+    _classify_diagnostic(result, th)
+    return result
+
+
+def _complete_valid_overlap_and_ecc(
+    result: AlignmentResult,
+    standard_gray: np.ndarray,
+    live_gray: np.ndarray,
+    th,
+) -> bool:
+    """Build valid pixels and refine with ECC; shared gate semantics for fallback."""
+    H = result.homography
+    if H is None or not _is_finite_homography(H):
+        result.diagnostic_reasons.append("homography contains a non-finite coefficient")
+        return False
+    try:
+        H_inv = np.linalg.inv(H)
+    except np.linalg.LinAlgError:
+        result.diagnostic_reasons.append("homography is singular")
+        return False
+    if not np.all(np.isfinite(H_inv)):
+        result.diagnostic_reasons.append("homography inverse contains a non-finite coefficient")
+        return False
+
+    result.stage_diagnostics.append("valid_overlap")
+    result.homography_inv = H_inv
+    live_mask = np.full(live_gray.shape[:2], 255, dtype=np.uint8)
+    valid_mask = cv2.warpPerspective(
+        live_mask, H_inv, (standard_gray.shape[1], standard_gray.shape[0]),
+        flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT, borderValue=0,
+    )
+    result.valid_mask = valid_mask
+    result.valid_overlap_available = True
+    result.valid_overlap_ratio = float(cv2.countNonZero(valid_mask) / valid_mask.size)
+    aligned_live = cv2.warpPerspective(
+        live_gray, H_inv, (standard_gray.shape[1], standard_gray.shape[0]),
+        flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0,
+    )
+    result.aligned_live = aligned_live
+    try:
+        result.stage_diagnostics.append("local_refinement_ecc")
+        result.ecc_attempted = True
+        ecc_warp = np.eye(2, 3, dtype=np.float32)
+        criteria = (
+            cv2.TERM_CRITERIA_COUNT | cv2.TERM_CRITERIA_EPS,
+            th.ecc_max_iterations,
+            th.ecc_epsilon,
+        )
+        ecc_result = cv2.findTransformECC(
+            standard_gray, aligned_live, ecc_warp, cv2.MOTION_AFFINE,
+            criteria, inputMask=valid_mask,
+        )
+        result.ecc_correlation = float(ecc_result[0] if isinstance(ecc_result, tuple) else ecc_result)
+        result.ecc_converged = True
+        result.aligned_live = cv2.warpAffine(
+            aligned_live, ecc_warp, (standard_gray.shape[1], standard_gray.shape[0]),
+            flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP,
+            borderMode=cv2.BORDER_CONSTANT, borderValue=0,
+        )
+        result.valid_mask = cv2.warpAffine(
+            valid_mask, ecc_warp, (standard_gray.shape[1], standard_gray.shape[0]),
+            flags=cv2.INTER_NEAREST | cv2.WARP_INVERSE_MAP,
+            borderMode=cv2.BORDER_CONSTANT, borderValue=0,
+        )
+        result.valid_overlap_ratio = float(
+            cv2.countNonZero(result.valid_mask) / result.valid_mask.size
+        )
+        result.standard_to_live = H @ np.vstack([ecc_warp, np.array([0.0, 0.0, 1.0])])
+    except (cv2.error, TypeError, RuntimeError) as exc:
+        result.ecc_failure_detail = f"ECC refinement did not converge ({type(exc).__name__})"
+    return True
 
 
 def _compute_projected_geometry(

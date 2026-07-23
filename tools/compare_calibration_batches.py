@@ -19,6 +19,17 @@ from pathlib import Path
 from typing import Any
 
 
+# The 29/628 figure was established during the stage-5 review from complete
+# homography evidence.  The exported stage-5 component CSV deliberately stores
+# derived geometry only, not the original H matrices, so that historical
+# classifier cannot be reconstructed exactly from CSV alone.
+HISTORICAL_FALSE_USABLE_BASELINE = {
+    "date": "2026-07-22",
+    "suspect_usable_components": 29,
+    "usable_components": 628,
+}
+
+
 def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Compare two local image-comparison calibration analyses."
@@ -65,7 +76,8 @@ def _counts(rows: list[dict[str, str]], key: str) -> dict[str, int]:
     return dict(Counter((row.get(key) or "missing") for row in rows))
 
 
-def _is_suspect_signature(row: dict[str, str]) -> bool:
+def _is_runtime_zoom_proxy_signature(row: dict[str, str]) -> bool:
+    """Return the #6 runtime proxy; it is not the historical 29-case label."""
     center = _number(row.get("center_displacement_relative_diagonal"))
     area_ratio = _number(row.get("projected_area_ratio"))
     coverage = _number(row.get("spatial_coverage"))
@@ -78,16 +90,53 @@ def _is_suspect_signature(row: dict[str, str]) -> bool:
     )
 
 
-def _signature_summary(rows: list[dict[str, str]]) -> dict[str, int | float | None]:
+def _runtime_proxy_summary(rows: list[dict[str, str]]) -> dict[str, int | float | None]:
     usable = [row for row in rows if row.get("diagnostic") == "usable"]
-    signatures = [row for row in usable if _is_suspect_signature(row)]
-    all_signatures = [row for row in rows if _is_suspect_signature(row)]
+    signatures = [row for row in usable if _is_runtime_zoom_proxy_signature(row)]
+    all_signatures = [row for row in rows if _is_runtime_zoom_proxy_signature(row)]
     return {
         "usable_components": len(usable),
         "suspect_usable_components": len(signatures),
         "suspect_usable_rate": _rate(len(signatures), len(usable)),
         "all_signature_components": len(all_signatures),
     }
+
+
+def _ecc_nonconvergence_gate_summary(rows: list[dict[str, str]]) -> dict[str, int | float | None]:
+    """Summarize the gate whose new semantics are exactly reconstructable."""
+    usable = [row for row in rows if row.get("diagnostic") == "usable"]
+    ecc_not_converged = [
+        row for row in rows if _number(row.get("ecc_converged")) == 0.0
+    ]
+    usable_ecc_not_converged = [
+        row for row in usable if _number(row.get("ecc_converged")) == 0.0
+    ]
+    return {
+        "usable_components": len(usable),
+        "all_ecc_not_converged_components": len(ecc_not_converged),
+        "usable_ecc_not_converged_components": len(usable_ecc_not_converged),
+        "usable_ecc_not_converged_rate": _rate(
+            len(usable_ecc_not_converged), len(usable)
+        ),
+    }
+
+
+def _mapping_failure_category(detail: str | None) -> str:
+    if not detail:
+        return "missing_detail"
+    if detail.startswith("post-alignment appearance NCC"):
+        return "appearance_ncc"
+    if detail.startswith("post-alignment appearance SSIM"):
+        return "appearance_ssim"
+    if detail.startswith("live expected-component resolution"):
+        return "effective_resolution"
+    if detail.startswith("the expected-component candidate has insufficient in-frame"):
+        return "in_frame_coverage"
+    if detail.startswith("the projected expected-component candidate has invalid"):
+        return "invalid_geometry"
+    if detail.startswith("valid comparison mask"):
+        return "valid_mask_unavailable"
+    return "other"
 
 
 def _mapping_summary(rows: list[dict[str, str]]) -> dict[str, Any]:
@@ -104,6 +153,15 @@ def _mapping_summary(rows: list[dict[str, str]]) -> dict[str, Any]:
         "mapping_usable_rate": _rate(len(usable), len(recorded)),
         "global_alignment_usable_but_mapping_rejected": len(global_usable_rejected),
         "rejection_reasons": _counts(rejected, "component_mapping_failure_reason"),
+        "rejection_categories": dict(
+            Counter(_mapping_failure_category(row.get("component_mapping_failure_detail")) for row in rejected)
+        ),
+        "global_alignment_usable_rejection_categories": dict(
+            Counter(
+                _mapping_failure_category(row.get("component_mapping_failure_detail"))
+                for row in global_usable_rejected
+            )
+        ),
     }
 
 
@@ -150,9 +208,25 @@ def compare(baseline_directory: Path, current_directory: Path) -> dict[str, Any]
         "report_kind": "issue6_trusted_alignment_comparison",
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
         "definition": {
-            "suspect_false_usable_signature": (
-                "diagnostic == usable, near-identity homography, spatial_coverage < 0.20, "
-                "and ecc_converged == 0"
+            "historical_false_usable_baseline": {
+                **HISTORICAL_FALSE_USABLE_BASELINE,
+                "rate": _rate(
+                    HISTORICAL_FALSE_USABLE_BASELINE["suspect_usable_components"],
+                    HISTORICAL_FALSE_USABLE_BASELINE["usable_components"],
+                ),
+                "note": (
+                    "The original near-identity-H classifier used full alignment evidence "
+                    "that was not retained in the stage-5 aggregate CSV."
+                ),
+            },
+            "runtime_zoom_proxy_signature": (
+                "near-identity geometry proxy (center displacement <= 0.05 diagonal and "
+                "area ratio within 0.15), spatial_coverage < 0.20, and ecc_converged == 0; "
+                "this is a broader, CSV-reconstructable proxy and is not the 29-case label"
+            ),
+            "ecc_nonconvergence_gate": (
+                "diagnostic == usable and ecc_converged == 0; this directly verifies that "
+                "the #6 ECC negative-evidence gate cannot be bypassed"
             ),
             "scope": (
                 "Calibration observations only.  Neither candidate counts nor gate rates are "
@@ -164,14 +238,16 @@ def compare(baseline_directory: Path, current_directory: Path) -> dict[str, Any]
             "batch": _batch_summary(baseline_analysis),
             "component_diagnostics": _counts(baseline_rows, "diagnostic"),
             "ecc_converged": _counts(baseline_rows, "ecc_converged"),
-            "suspect_false_usable_signature": _signature_summary(baseline_rows),
+            "ecc_nonconvergence_gate": _ecc_nonconvergence_gate_summary(baseline_rows),
+            "runtime_zoom_proxy_signature": _runtime_proxy_summary(baseline_rows),
         },
         "current": {
             "analysis_directory": str(current_directory),
             "batch": _batch_summary(current_analysis),
             "component_diagnostics": _counts(current_rows, "diagnostic"),
             "ecc_converged": _counts(current_rows, "ecc_converged"),
-            "suspect_false_usable_signature": _signature_summary(current_rows),
+            "ecc_nonconvergence_gate": _ecc_nonconvergence_gate_summary(current_rows),
+            "runtime_zoom_proxy_signature": _runtime_proxy_summary(current_rows),
             "component_mapping": _mapping_summary(current_rows),
         },
         "component_metric_distributions": {
@@ -203,8 +279,11 @@ def write_report(output_directory: Path, report: dict[str, Any]) -> None:
     baseline = report["baseline"]
     current = report["current"]
     mapping = current["component_mapping"]
-    baseline_signature = baseline["suspect_false_usable_signature"]
-    current_signature = current["suspect_false_usable_signature"]
+    historical_baseline = report["definition"]["historical_false_usable_baseline"]
+    baseline_ecc_gate = baseline["ecc_nonconvergence_gate"]
+    current_ecc_gate = current["ecc_nonconvergence_gate"]
+    baseline_signature = baseline["runtime_zoom_proxy_signature"]
+    current_signature = current["runtime_zoom_proxy_signature"]
     lines = [
         "# 阶段 5 与阶段 6 本地标定对比",
         "",
@@ -225,13 +304,22 @@ def write_report(output_directory: Path, report: dict[str, Any]) -> None:
         "",
         f"- 阶段 5 组件对齐诊断：{json.dumps(baseline['component_diagnostics'], ensure_ascii=False)}。",
         f"- 阶段 6 组件对齐诊断：{json.dumps(current['component_diagnostics'], ensure_ascii=False)}。",
-        f"- 伪可用签名（近似恒等 H、低覆盖、ECC 未收敛）：阶段 5 为 "
+        f"- 阶段 5 已发布的历史伪可用基线：{historical_baseline['suspect_usable_components']}/"
+        f"{historical_baseline['usable_components']}（{_percent(historical_baseline['rate'])}）。"
+        "该 29 个案例依赖原始 H 的人工/完整证据判定，不能由阶段 5 汇总 CSV 精确回算。",
+        f"- 可精确回算的 ECC 未收敛绕过：阶段 5 为 "
+        f"{baseline_ecc_gate['usable_ecc_not_converged_components']}/"
+        f"{baseline_ecc_gate['usable_components']}（{_percent(baseline_ecc_gate['usable_ecc_not_converged_rate'])}）；"
+        f"阶段 6 为 {current_ecc_gate['usable_ecc_not_converged_components']}/"
+        f"{current_ecc_gate['usable_components']}（{_percent(current_ecc_gate['usable_ecc_not_converged_rate'])}）。",
+        f"- 以当前运行时几何代理回溯（近似恒等几何、低覆盖、ECC 未收敛）：阶段 5 为 "
         f"{baseline_signature['suspect_usable_components']}/"
         f"{baseline_signature['usable_components']}（{_percent(baseline_signature['suspect_usable_rate'])}）；"
         f"阶段 6 为 {current_signature['suspect_usable_components']}/"
-        f"{current_signature['usable_components']}（{_percent(current_signature['suspect_usable_rate'])}）。",
-        f"- 阶段 6 仍观察到该签名 {current_signature['all_signature_components']} 个，"
-        "但只有仍被标为全图 usable 的才计入伪可用率。",
+        f"{current_signature['usable_components']}（{_percent(current_signature['suspect_usable_rate'])}）。"
+        "此代理比历史 29 个标签宽，不能把两个数值直接等同。",
+        f"- 阶段 6 仍观察到该运行时代理签名 {current_signature['all_signature_components']} 个，"
+        "但均未被标为全图 usable。",
         "",
         "## 阶段 6 新增部件映射闸门",
         "",
@@ -241,6 +329,9 @@ def write_report(output_directory: Path, report: dict[str, Any]) -> None:
         f"- 全图对齐仍为 usable、但被部件映射闸门阻断："
         f"{mapping['global_alignment_usable_but_mapping_rejected']}。",
         f"- 映射拒绝原因：{json.dumps(mapping['rejection_reasons'], ensure_ascii=False)}。",
+        f"- 映射拒绝细分类：{json.dumps(mapping['rejection_categories'], ensure_ascii=False)}；"
+        f"其中原本全图 usable 后被映射门槛截断的细分类："
+        f"{json.dumps(mapping['global_alignment_usable_rejection_categories'], ensure_ascii=False)}。",
         "",
         "## 指标分布（部件观察）",
         "",

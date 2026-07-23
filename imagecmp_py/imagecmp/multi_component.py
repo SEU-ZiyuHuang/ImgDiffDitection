@@ -75,6 +75,7 @@ class MultiComponentImageComparisonService:
                 state=result.state,
                 unavailable_reason=result.unavailable_reason,
                 unavailable_detail=result.unavailable_detail,
+                image_mismatch_detail=result.image_mismatch_detail,
                 detection_regions=result.detection_regions,
                 artifacts=result.artifacts,
                 alignment_metrics=result.alignment_metrics,
@@ -248,10 +249,12 @@ class MultiComponentImageComparisonService:
 def aggregate_component_conclusions(
     conclusions: Sequence[ComponentConclusion],
 ) -> ComparisonState:
-    """Aggregate safely: change wins, then unavailable, then all-normal."""
+    """Aggregate safely: confirmed image mismatch wins, then change, unavailable, normal."""
     if not conclusions:
         raise ValueError("an image comparison requires at least one expected component")
     states = {conclusion.state for conclusion in conclusions}
+    if ComparisonState.IMAGE_MISMATCH_DETECTED in states:
+        return ComparisonState.IMAGE_MISMATCH_DETECTED
     if ComparisonState.CHANGE_DETECTED in states:
         return ComparisonState.CHANGE_DETECTED
     if ComparisonState.DETECTION_UNAVAILABLE in states:
@@ -355,6 +358,7 @@ def _component_conclusion_json(conclusion: ComponentConclusion) -> dict:
             conclusion.unavailable_reason.value if conclusion.unavailable_reason else None
         ),
         "unavailable_detail": conclusion.unavailable_detail,
+        "image_mismatch_detail": conclusion.image_mismatch_detail,
         "detection_regions": [_region_json(region) for region in conclusion.detection_regions],
         "artifacts": _artifacts_json(conclusion.artifacts),
         "alignment_metrics": conclusion.alignment_metrics,
@@ -370,6 +374,7 @@ def _region_json(region) -> dict:
         "height": region.height,
         "confidence": region.confidence,
         "evidence_channels": region.evidence_channels,
+        "decision_eligible": region.decision_eligible,
     }
 
 

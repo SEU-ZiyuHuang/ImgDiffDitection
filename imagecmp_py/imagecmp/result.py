@@ -13,6 +13,7 @@ class ComparisonState(Enum):
 
     NO_CHANGE_HIGH_CONFIDENCE = "no_change_high_confidence"
     CHANGE_DETECTED = "change_detected"
+    IMAGE_MISMATCH_DETECTED = "image_mismatch_detected"
     DETECTION_UNAVAILABLE = "detection_unavailable"
 
 
@@ -21,6 +22,7 @@ class UnavailableReason(Enum):
 
     MATCH_UNCERTAIN = "match_uncertain"
     ALIGNMENT_FAILED = "alignment_failed"
+    IMAGE_QUALITY_INSUFFICIENT = "image_quality_insufficient"
 
 
 class ComparisonMode(Enum):
@@ -44,6 +46,7 @@ class DetectionRegion:
     height: int
     confidence: float
     evidence_channels: list[str] = field(default_factory=list)
+    decision_eligible: bool = False
 
 
 @dataclass(frozen=True)
@@ -64,6 +67,7 @@ class ComparisonResult:
     state: ComparisonState
     unavailable_reason: Optional[UnavailableReason] = None
     unavailable_detail: str = ""
+    image_mismatch_detail: str = ""
     detection_regions: list[DetectionRegion] = field(default_factory=list)
     artifacts: Optional[ArtifactSet] = None
     alignment_metrics: dict = field(default_factory=dict)
@@ -79,6 +83,7 @@ class ComponentConclusion:
     state: ComparisonState
     unavailable_reason: Optional[UnavailableReason] = None
     unavailable_detail: str = ""
+    image_mismatch_detail: str = ""
     detection_regions: list[DetectionRegion] = field(default_factory=list)
     artifacts: Optional[ArtifactSet] = None
     alignment_metrics: dict = field(default_factory=dict)

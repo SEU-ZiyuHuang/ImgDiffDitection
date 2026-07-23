@@ -14,7 +14,7 @@ from typing import Optional
 import cv2
 import numpy as np
 
-from .alignment import AlignmentDiagnostic, AlignmentResult, align
+from .alignment import AlignmentDiagnostic, AlignmentResult, align, clear_alignment_cache
 from .artifacts import write_all_artifacts
 from .compare import CompareResult, compare_aligned
 from .config import CalibratedConfig, default_config, load_config
@@ -33,6 +33,11 @@ from .roi import parse_roi_string, roi_to_pixel_rect
 
 class ImageComparisonService:
     """Compare one caller-specified expected component."""
+
+    def __init__(self) -> None:
+        # Reuse one alignment within this service instance, but never carry
+        # evidence across independently created services.
+        clear_alignment_cache()
 
     def compare(
         self,
@@ -91,7 +96,11 @@ class ImageComparisonService:
             output_dir=output_dir,
             config=config,
         )
-        detail = result.unavailable_detail or "alignment and difference observations collected"
+        detail = (
+            result.image_mismatch_detail
+            or result.unavailable_detail
+            or "alignment and difference observations collected"
+        )
         return CalibrationComponentObservation(
             component_index=component_index,
             category=parsed_roi.category,
@@ -253,6 +262,14 @@ class ImageComparisonService:
             artifacts = _write_unavailable_artifacts(
                 standard, live, alignment, projected_live_rect, output_dir, detail
             )
+            if mapping is not None and mapping.appearance_mismatch_confirmed:
+                return ComparisonResult(
+                    state=ComparisonState.IMAGE_MISMATCH_DETECTED,
+                    image_mismatch_detail=detail,
+                    artifacts=artifacts,
+                    alignment_metrics=metrics,
+                    config_version=config.version,
+                )
             return ComparisonResult(
                 state=ComparisonState.DETECTION_UNAVAILABLE,
                 unavailable_reason=reason,
@@ -271,11 +288,15 @@ class ImageComparisonService:
             processing_scale=mapping.comparison_scale,
         )
         metrics["roi_valid_overlap_ratio"] = comparison.valid_pixel_ratio
+        metrics.update(comparison.evidence_metrics)
 
         live_regions = _map_regions_to_live(
             comparison.detection_regions, standard_to_live, live.shape[:2]
         )
-        if live_regions is None:
+        live_decision_regions = _map_regions_to_live(
+            comparison.decision_regions, standard_to_live, live.shape[:2]
+        )
+        if live_regions is None or live_decision_regions is None:
             detail = "a detected candidate could not be mapped into the live-image frame"
             artifacts = _write_artifacts(
                 standard, live, standard_to_live, alignment, comparison,
@@ -294,9 +315,19 @@ class ImageComparisonService:
             standard, live, standard_to_live, alignment, comparison,
             projected_live_rect, live_regions, output_dir, "",
         )
+        if not comparison.comparison_quality_usable:
+            return ComparisonResult(
+                state=ComparisonState.DETECTION_UNAVAILABLE,
+                unavailable_reason=UnavailableReason.IMAGE_QUALITY_INSUFFICIENT,
+                unavailable_detail=comparison.comparison_quality_detail,
+                detection_regions=live_regions,
+                artifacts=artifacts,
+                alignment_metrics=metrics,
+                config_version=config.version,
+            )
         state = (
             ComparisonState.CHANGE_DETECTED
-            if live_regions else ComparisonState.NO_CHANGE_HIGH_CONFIDENCE
+            if live_decision_regions else ComparisonState.NO_CHANGE_HIGH_CONFIDENCE
         )
         return ComparisonResult(
             state=state,
@@ -372,6 +403,7 @@ def _map_regions_to_live(
             height=height,
             confidence=region.confidence,
             evidence_channels=region.evidence_channels,
+            decision_eligible=region.decision_eligible,
         ))
     return regions
 
@@ -441,6 +473,7 @@ def _result_to_json(result: ComparisonResult) -> str:
             result.unavailable_reason.value if result.unavailable_reason else None
         ),
         "unavailable_detail": result.unavailable_detail,
+        "image_mismatch_detail": result.image_mismatch_detail,
         "detection_regions": [
             {
                 "x": region.x,
@@ -449,6 +482,7 @@ def _result_to_json(result: ComparisonResult) -> str:
                 "height": region.height,
                 "confidence": region.confidence,
                 "evidence_channels": region.evidence_channels,
+                "decision_eligible": region.decision_eligible,
             }
             for region in result.detection_regions
         ],

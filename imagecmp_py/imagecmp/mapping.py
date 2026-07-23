@@ -43,6 +43,10 @@ class ComponentMappingEvidence:
     roi_valid_overlap_ratio: float = _NAN
     appearance_ncc: float = _NAN
     appearance_ssim: float = _NAN
+    appearance_histogram_ncc: float = _NAN
+    appearance_local_contrast_ncc: float = _NAN
+    appearance_gradient_ncc: float = _NAN
+    appearance_mismatch_confirmed: bool = False
 
     effective_resolution_scale: float = _NAN
     effective_resolution_anisotropy: float = _NAN
@@ -67,6 +71,10 @@ class ComponentMappingEvidence:
             ("roi_valid_overlap_ratio", self.roi_valid_overlap_ratio),
             ("appearance_ncc", self.appearance_ncc),
             ("appearance_ssim", self.appearance_ssim),
+            ("appearance_histogram_ncc", self.appearance_histogram_ncc),
+            ("appearance_local_contrast_ncc", self.appearance_local_contrast_ncc),
+            ("appearance_gradient_ncc", self.appearance_gradient_ncc),
+            ("appearance_mismatch_confirmed", 1 if self.appearance_mismatch_confirmed else 0),
             ("effective_resolution_scale", self.effective_resolution_scale),
             ("effective_resolution_anisotropy", self.effective_resolution_anisotropy),
             ("effective_live_width_pixels", self.effective_live_width_pixels),
@@ -220,21 +228,58 @@ def evaluate_component_mapping(
             UnavailableReason.MATCH_UNCERTAIN,
             "post-alignment appearance consistency could not be measured",
         )
-    if evidence.appearance_ncc < th.appearance_ncc_min:
+    ncc_failed = evidence.appearance_ncc < th.appearance_ncc_min
+    ssim_failed = evidence.appearance_ssim < th.appearance_ssim_min
+    if not ncc_failed and not ssim_failed:
+        return evidence
+
+    # A low raw appearance score alone is not proof that the live image shows
+    # a different component: illumination, contrast and exposure can cause it.
+    # Confirm an image mismatch only when the global alignment and all earlier
+    # component gates passed, the raw NCC failed, and every illumination-
+    # resistant structural check also remains below the same NCC floor.
+    evidence.stage_diagnostics.append("appearance_mismatch_confirmation")
+    histogram_matched_live = _histogram_match(live_gray, standard_gray, appearance_mask)
+    evidence.appearance_histogram_ncc = _masked_ncc(
+        standard_gray, histogram_matched_live, appearance_mask
+    )
+    standard_local = _local_contrast(standard_gray)
+    live_local = _local_contrast(live_gray)
+    evidence.appearance_local_contrast_ncc = _masked_ncc(
+        standard_local, live_local, appearance_mask
+    )
+    standard_gradient = _gradient_magnitude(standard_gray)
+    live_gradient = _gradient_magnitude(live_gray)
+    evidence.appearance_gradient_ncc = _masked_ncc(
+        standard_gradient, live_gradient, appearance_mask
+    )
+    confirmation_scores = (
+        evidence.appearance_histogram_ncc,
+        evidence.appearance_local_contrast_ncc,
+        evidence.appearance_gradient_ncc,
+    )
+    if ncc_failed and all(
+        math.isfinite(score) and score < th.appearance_ncc_min
+        for score in confirmation_scores
+    ):
+        evidence.appearance_mismatch_confirmed = True
         return _fail(
             evidence,
             UnavailableReason.MATCH_UNCERTAIN,
-            "post-alignment appearance NCC below configured minimum "
-            f"({evidence.appearance_ncc:.3f} < {th.appearance_ncc_min:.3f})",
+            "post-alignment appearance remains inconsistent after histogram, "
+            "local-contrast, and edge checks; image mismatch is confirmed "
+            f"(raw NCC {evidence.appearance_ncc:.3f}; "
+            f"histogram {evidence.appearance_histogram_ncc:.3f}; "
+            f"local contrast {evidence.appearance_local_contrast_ncc:.3f}; "
+            f"edge {evidence.appearance_gradient_ncc:.3f})",
         )
-    if evidence.appearance_ssim < th.appearance_ssim_min:
-        return _fail(
-            evidence,
-            UnavailableReason.MATCH_UNCERTAIN,
-            "post-alignment appearance SSIM below configured minimum "
-            f"({evidence.appearance_ssim:.3f} < {th.appearance_ssim_min:.3f})",
-        )
-    return evidence
+    return _fail(
+        evidence,
+        UnavailableReason.MATCH_UNCERTAIN,
+        "post-alignment appearance did not meet the raw NCC/SSIM gate, but "
+        "illumination-resistant checks still retain structural similarity; "
+        "the component mapping is not reliable enough for a conclusion",
+    )
 
 
 def _fail(
@@ -355,6 +400,42 @@ def _masked_ncc(
     if denominator <= 1e-12:
         return 1.0 if np.allclose(values_standard, values_live) else _NAN
     return float(np.dot(centered_standard, centered_live) / denominator)
+
+
+def _histogram_match(
+    source_gray: np.ndarray,
+    reference_gray: np.ndarray,
+    mask: np.ndarray,
+) -> np.ndarray:
+    """Map source brightness levels to the reference brightness distribution."""
+    source_values = source_gray[mask].astype(np.uint8)
+    reference_values = reference_gray[mask].astype(np.uint8)
+    if source_values.size < 2 or reference_values.size < 2:
+        return source_gray.copy()
+    source_levels, source_counts = np.unique(source_values, return_counts=True)
+    reference_levels, reference_counts = np.unique(reference_values, return_counts=True)
+    source_quantiles = np.cumsum(source_counts, dtype=np.float64) / source_values.size
+    reference_quantiles = np.cumsum(reference_counts, dtype=np.float64) / reference_values.size
+    mapped_levels = np.interp(source_quantiles, reference_quantiles, reference_levels)
+    lookup = np.arange(256, dtype=np.float32)
+    lookup[source_levels] = mapped_levels.astype(np.float32)
+    return cv2.LUT(source_gray, np.clip(np.rint(lookup), 0, 255).astype(np.uint8))
+
+
+def _local_contrast(gray: np.ndarray) -> np.ndarray:
+    """Remove slow brightness variation while retaining local texture."""
+    image = gray.astype(np.float32)
+    mean = cv2.GaussianBlur(image, (15, 15), 0)
+    variance = cv2.GaussianBlur(image * image, (15, 15), 0) - mean * mean
+    return (image - mean) / (np.sqrt(np.maximum(variance, 0.0)) + 1.0)
+
+
+def _gradient_magnitude(gray: np.ndarray) -> np.ndarray:
+    """Return brightness-insensitive edge strength for structural comparison."""
+    image = gray.astype(np.float32)
+    horizontal = cv2.Sobel(image, cv2.CV_32F, 1, 0, ksize=3)
+    vertical = cv2.Sobel(image, cv2.CV_32F, 0, 1, ksize=3)
+    return cv2.magnitude(horizontal, vertical)
 
 
 def _masked_ssim(

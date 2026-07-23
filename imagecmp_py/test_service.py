@@ -2,8 +2,8 @@
 """Automated tests for ImageComparisonService using synthetic fixtures.
 
 Tests cover:
-  - Three client-facing states: NO_CHANGE_HIGH_CONFIDENCE, CHANGE_DETECTED,
-    DETECTION_UNAVAILABLE
+  - Four client-facing states: NO_CHANGE_HIGH_CONFIDENCE, CHANGE_DETECTED,
+    IMAGE_MISMATCH_DETECTED, DETECTION_UNAVAILABLE
   - Input validation errors (missing files, invalid ROI, unwritable output)
   - Artifact completeness (all five evidence files written)
   - ROI boundary-tolerance normalization
@@ -595,8 +595,8 @@ def test_zoom_parent_child_signature_is_match_uncertain():
         assert "zoom/parent-child" in result.unavailable_detail
 
 
-def test_post_alignment_appearance_inconsistency_is_match_uncertain():
-    """A globally mapped but visually inconsistent component is not a change call."""
+def test_post_alignment_appearance_inconsistency_confirms_image_mismatch():
+    """A clearly different component after a usable alignment is an image mismatch."""
     service = ImageComparisonService()
     standard = _create_textured_image()
     live = standard.copy()
@@ -624,12 +624,12 @@ def test_post_alignment_appearance_inconsistency_is_match_uncertain():
             config_path,
         )
 
-        assert result.state == ComparisonState.DETECTION_UNAVAILABLE
-        assert result.unavailable_reason is not None
-        assert result.unavailable_reason.value == "match_uncertain"
-        assert "post-alignment appearance" in result.unavailable_detail
+        assert result.state == ComparisonState.IMAGE_MISMATCH_DETECTED
+        assert result.unavailable_reason is None
+        assert "image mismatch is confirmed" in result.image_mismatch_detail
         assert result.alignment_metrics["candidate_localized"] == 1
         assert result.alignment_metrics["component_mapping_usable"] == 0
+        assert result.alignment_metrics["appearance_mismatch_confirmed"] == 1
 
 
 def test_coarser_live_component_resolution_controls_comparison_scale():
@@ -860,11 +860,18 @@ def test_aggregate_never_turns_change_or_unavailable_into_normal():
         category="unavailable",
         state=ComparisonState.DETECTION_UNAVAILABLE,
     )
+    image_mismatch = ComponentConclusion(
+        component_index=2,
+        category="image_mismatch",
+        state=ComparisonState.IMAGE_MISMATCH_DETECTED,
+    )
     from imagecmp import aggregate_component_conclusions
 
     assert aggregate_component_conclusions([normal, changed]) == ComparisonState.CHANGE_DETECTED
     assert (aggregate_component_conclusions([normal, unavailable])
             == ComparisonState.DETECTION_UNAVAILABLE)
+    assert (aggregate_component_conclusions([normal, changed, image_mismatch])
+            == ComparisonState.IMAGE_MISMATCH_DETECTED)
     assert (aggregate_component_conclusions([normal])
             == ComparisonState.NO_CHANGE_HIGH_CONFIDENCE)
 
@@ -918,8 +925,8 @@ def _run_tests() -> int:
          test_ecc_non_convergence_is_negative_alignment_evidence),
         ("zoom_parent_child_signature_is_match_uncertain",
          test_zoom_parent_child_signature_is_match_uncertain),
-        ("post_alignment_appearance_inconsistency_is_match_uncertain",
-         test_post_alignment_appearance_inconsistency_is_match_uncertain),
+        ("post_alignment_appearance_inconsistency_confirms_image_mismatch",
+         test_post_alignment_appearance_inconsistency_confirms_image_mismatch),
         ("coarser_live_component_resolution_controls_comparison_scale",
          test_coarser_live_component_resolution_controls_comparison_scale),
         ("too_coarse_live_component_is_explicitly_unavailable",

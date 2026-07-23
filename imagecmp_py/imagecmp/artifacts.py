@@ -132,20 +132,21 @@ def write_annotated_image(
         cv2.rectangle(annotated, (x, y), (x + width, y + height), (0, 255, 0), 2)
 
     for det in detections:
+        colour = (0, 0, 255) if det.decision_eligible else (0, 180, 255)
         cv2.rectangle(
             annotated,
             (det.x, det.y),
             (det.x + det.width, det.y + det.height),
-            (0, 0, 255),
+            colour,
             2,
         )
         cv2.putText(
             annotated,
-            f"{det.confidence:.2f}",
+            f"{det.confidence:.2f}{'' if det.decision_eligible else ' review'}",
             (det.x, max(det.y - 5, 12)),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.45,
-            (0, 0, 255),
+            colour,
             1,
             cv2.LINE_AA,
         )
